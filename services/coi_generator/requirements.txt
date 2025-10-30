@@ -1,0 +1,11 @@
+flask
+fillpdf
+PyMuPDF
+pypdf
+google-cloud-secret-manager
+google-cloud-firestore
+google-auth-oauthlib
+google-auth
+google-cloud-storage
+google-api-python-client
+openai
