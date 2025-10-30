@@ -2,6 +2,7 @@ import os
 import json
 import base64
 import mimetypes
+import time
 import requests
 from flask import Flask, request
 from google.cloud import firestore
@@ -44,15 +45,15 @@ def get_gmail_credentials(user_email: str):
     return creds
 
 
-
-
 def send_message(chat_id, text, buttons=None):
     """Send a Telegram message with optional inline buttons."""
     payload = {"chat_id": chat_id, "text": text, "parse_mode": "Markdown"}
 
     if buttons:
         payload["reply_markup"] = {"inline_keyboard": buttons}
+    start = time.time()
     requests.post(f"{TELEGRAM_API}/sendMessage", json=payload)
+    print(f"[TIMING] Telegram sendMessage: {time.time() - start:.2f}s")
 
 
 def handle_callback(data):
@@ -65,7 +66,9 @@ def handle_callback(data):
 
     # Acknowledge callback (stops Telegram spinner)
     callback_id = cq.get("id")
+    start = time.time()
     requests.post(f"{TELEGRAM_API}/answerCallbackQuery", json={"callback_query_id": callback_id})
+    print(f"[TIMING] Telegram answerCallbackQuery: {time.time() - start:.2f}s")
 
     # Parse "send:<thread_id>" or "nosend:<thread_id>"
     if ":" in callback_data:
@@ -85,11 +88,21 @@ def handle_callback(data):
 
     subject = doc.to_dict().get("subject")
 
+    # If already resolved, do not process again
+    current_status = doc_dict.get("status")
+    if current_status and current_status != "pending":
+        send_message(chat_id, f"ℹ️ This request is already resolved (status: *{current_status}*).")
+        return
+
     if action == "send":
         print(f"User approved sending COI for thread {thread_id}")
-        doc_ref.update({"status": "sent"})
+        doc_ref.update({
+            "status": "sent",
+            "resolved_at": datetime.utcnow().isoformat()
+        })
         send_message(chat_id, f"✅ Sending COI for:\n*{subject or thread_id}*")
 
+        start = time.time()
         requests.post(COI_GENERATOR_CLOUD_RUN, json={
             "action": "generate_coi",
             "insured_inferred": doc_dict.get("insured_inferred", False),
@@ -99,14 +112,21 @@ def handle_callback(data):
             "holder_addr_1": doc_dict.get("holder_addr_1", ""),
             "holder_addr_2": doc_dict.get("holder_addr_2", ""),
             "send_to_email": doc_dict.get("send_to_email", ""),
+            "to_emails": doc_dict.get("to_emails", []),
+            "cc_emails": doc_dict.get("cc_emails", []),
+            "last_message_id": doc_dict.get("last_message_id", ""),
             "thread_id": thread_id,
             "subject_text": f"Re: {subject or 'Certificate Request'}",
-            "body_text": "Please find attached the Certificate of Insurance."
+            "body_text": "Hello,\nPlease see the COI attached."
         })
+        print(f"[TIMING] COI Generator generate_coi: {time.time() - start:.2f}s")
 
     elif action == "nosend":
         print(f"User declined COI for thread {thread_id}")
-        doc_ref.update({"status": "skipped"})
+        doc_ref.update({
+            "status": "skipped",
+            "resolved_at": datetime.utcnow().isoformat()
+        })
         send_message(chat_id, f"🚫 Skipped COI for:\n*{subject or thread_id}*")
 
 
@@ -131,6 +151,9 @@ def notify_about_coi_request(data):
         "holder_addr_1": data["holder_addr_1"],
         "holder_addr_2": data["holder_addr_2"],
         "send_to_email": data["send_to_email"],
+        "to_emails": data.get("to_emails", []),
+        "cc_emails": data.get("cc_emails", []),
+        "last_message_id": data.get("last_message_id", ""),
         "timestamp": datetime.utcnow().isoformat()
     })
 
@@ -149,11 +172,26 @@ def notify_about_coi_request(data):
             {"text": "🚫 Don't send", "callback_data": f"nosend:{thread_id}"}
         ]]
 
-        send_message(data["chat_id"], f"Email likely a COI request:\n*{data['subject']}*", buttons)
+        # Compose a rich preview with inferred details
+        info_lines = [
+            f"*Insured:* {data['insured_name']}",
+            f"*Holder:* {data['holder_name']}",
+            f"*Address:* {data['holder_addr_1']}",
+            f"*{data['holder_addr_2']}*" if data['holder_addr_2'] else "",
+        ]
+        info_text = "\n".join([line for line in info_lines if line])
+
+        message_text = (
+            f"Email likely a COI request:\n*{data['subject']}*\n\n"
+            f"{info_text}"
+        )
+
+        send_message(data["chat_id"], message_text, buttons)
 
 
 @app.route("/", methods=["POST"])
 def telegram_bot(request):
+    request_start = time.time()
     data = request.get_json()
     print('GOT /telegram_bot REQUEST WITH BODY:')
 
@@ -163,6 +201,7 @@ def telegram_bot(request):
         notify_about_coi_request(data)
     else:
         print(f"Invalid request received")
-        return ("", 400)
+        return ("", 204)
 
+    print(f"[TIMING] Total telegram_bot request: {time.time() - request_start:.2f}s")
     return ("", 204)
