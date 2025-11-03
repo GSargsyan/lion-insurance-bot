@@ -22,13 +22,14 @@ from pypdf import PdfReader, PdfWriter
 from email.message import EmailMessage
 from openai import OpenAI
 
+
 app = Flask(__name__)
 
 db = firestore.Client(database='lion-ins')
 # Initialize OpenAI client
 OPENAI_SECRET = os.environ.get("SECRET_NAME", "openai-key")
 GMAIL_SECRET = os.environ.get("SECRET_NAME", "gmail-service-account")
-GMAIL_SCOPES = ["https://www.googleapis.com/auth/gmail.send"]
+GMAIL_SCOPES = ["https://www.googleapis.com/auth/gmail.send", "https://www.googleapis.com/auth/gmail.compose"]
 
 # Define the scope to access to search and download files
 DRIVE_SCOPES = ["https://www.googleapis.com/auth/drive.readonly"]
@@ -285,7 +286,7 @@ def add_signature_and_flatten(pdf_path: str):
         print(f"❌ add_signature_and_flatten failed for {pdf_path}: {e}")
 
 
-def analyze_for_coi_request(subject: str, content: str):
+def is_coi_request(subject: str, content: str, from_email: str):
     prompt = f"""
     Your task is to analyze weather the email asks for certificate of insurance (is a COI request) or no.
     When they ask for a COI, they also specify certificate holder name and address, but sometimes they just write company name,
@@ -300,8 +301,14 @@ def analyze_for_coi_request(subject: str, content: str):
     Respond with ONLY a valid JSON object in this exact format:
     {{"is_likely_coi_request": true/false}}
     
-    Be conservative - only return true if there are clear indicators of a COI request.
+    Be conservative - only return true if there are clear indicators of a COI request and
+    there is clear indication of the certificate holder, broker name and address.
+
+    Cases to return false
+    1. If the sender is from coi@lioninsurance.us and the body hints that a COI was already made by us and is being sent
+    2. If the sender is from the Certificial (company that sends COI requests, but we don't work with them)
     
+    From email: {from_email}
     Subject: {subject}
     Content: {content}
     """
@@ -315,7 +322,7 @@ def analyze_for_coi_request(subject: str, content: str):
             {"role": "user", "content": prompt}
         ]
     ).choices[0].message.content
-    print(f"[TIMING] OpenAI analyze_for_coi_request: {time.time() - start:.2f}s")
+    print(f"[TIMING] OpenAI is_coi_request: {time.time() - start:.2f}s")
 
     try:
         rsp_json = json.loads(response)
@@ -334,23 +341,22 @@ def analyze_for_coi_request(subject: str, content: str):
     return rsp_json
 
 
-def infer_coi_request_info(subject: str, content: str, to_emails: list[str], cc_emails: list[str]):
+def infer_coi_request_info(subject: str, content: str, to_emails: list[str], cc_emails: list[str], from_email: str):
     prompt = f"""
     You are given a raw Certificate of Insurance (COI) request email subject and body.
     Your task is to analyze the email, infer and extract the following information:
         1. Weather the insured client/company name for which the client or the broker asks for COI is mentioned in the email.
-        2. The insured client/company name for which the client or the broker asks for COI.
-        3. Weather the certificate holder information is mentioned, which consists of:
-            a. The name of their company
-            b. Address line 1 (just the street address)
-            c. Address line 2 with the format: <city>, <state 2 letter code> <zip code>
-        3. Infer the main email address that the COI needs to be sent to, if none is mentioned, leave it blank
+        2. The insured client/company name for which the client or the broker asks for COI. Leave it blank if you can't infer it.
+        3. The certificate holder information, which consists of:
+            a. The name of their company.
+            b. Address line 1 (just the street address).
+            c. Address line 2 with the format: <city>, <state 2 letter code> <zip code>.
+        4. Try to infer the main email address that the COI needs to be sent to. This may be in the body, to's or cc's.
+           Holder name might give a clue on who to send the COI to. Leave it blank if you can't infer it.
     
     Respond with ONLY a valid JSON object in the exact format:
     {{
-        "insured_inferred": true/false,
         "insured_name": string,
-        "holder_inferred": true/false,
         "holder_name": string,
         "holder_addr_1": string,
         "holder_addr_2": string,
@@ -359,20 +365,18 @@ def infer_coi_request_info(subject: str, content: str, to_emails: list[str], cc_
 
     Example:
     {{
-        "insured_inferred": true,
         "insured_name": "RAPID TRUCKING INC",
-        "holder_inferred": true,
         "holder_name": "Highway App, Inc.",
         "holder_addr_1": "5931 Greenville Ave, Unit #5620",
         "holder_addr_2": "Dallas, TX 75206",
         "send_to_email": "insurance@certs.highway.com"
     }}
 
-    Set holder_inferred false if you can't infer it from the email.
     Here is the email you need to analyze:
     
     To emails: {", ".join(to_emails)}
     CC emails: {", ".join(cc_emails)}
+    From email: {from_email}
     Subject: {subject}
     Content: {content}
     """
@@ -396,8 +400,7 @@ def infer_coi_request_info(subject: str, content: str, to_emails: list[str], cc_
  
     try:
         rsp_json = json.loads(response)
-        rsp_json['insured_inferred']
-        rsp_json['holder_inferred']
+        rsp_json['insured_name']
     except Exception:
         doc_id = f"{datetime.now().strftime('%Y_%m_%d_%H_%M_%S_%f')}_{subject.replace(' ', '_')}"
         db.collection("coi_generator_errors").document(doc_id).set({
@@ -426,108 +429,6 @@ def get_gmail_credentials(user_email: str):
     return creds
 
 
-def send_coi(
-    thread_id: str,
-    to_emails: list[str],
-    cc_emails: list[str],
-    subject_text: str,
-    body_text: str,
-    file_names: list[str],
-    last_message_id: str | None = None,
-):
-    """
-    Replies to an existing Gmail thread (thread_id) via Tony’s Workspace Gmail using
-    the no-reply alias. Attaches provided PDFs. Honors To/CC lists.
-    """
-    try:
-        creds = get_gmail_credentials("tony@lioninsurance.us")
-        service = build("gmail", "v1", credentials=creds)
-
-        # PRODUCTION (reply inline) — commented out for testing
-        # msg = EmailMessage()
-        # if to_emails:
-        #     msg["To"] = ", ".join(to_emails)
-        # if cc_emails:
-        #     msg["Cc"] = ", ".join(cc_emails)
-        # msg["From"] = "no-reply@lioninsurance.us"
-        # msg["Subject"] = subject_text
-        # if last_message_id:
-        #     msg["In-Reply-To"] = last_message_id
-        #     msg["References"] = last_message_id
-        # msg.set_content(body_text)
-
-        # TESTING: send to Grig from Tony, include intended To/CC in body
-        display_to = ", ".join(to_emails or [])
-        display_cc = ", ".join(cc_emails or [])
-        testing_body = (
-            f"{body_text}\n\n---\n[TEST INFO]\n"
-            f"Would send To: {display_to or '(none)'}\n"
-            f"Would CC: {display_cc or '(none)'}\n"
-            f"Thread: {thread_id}\n"
-        )
-        msg = EmailMessage()
-        msg["To"] = "g.sargsyan1995@gmail.com"
-        msg["From"] = "tony@lioninsurance.us"
-        msg["Subject"] = subject_text
-        msg.set_content(testing_body)
-
-        # --- Attach PDFs from GCS ---
-        storage_client = storage.Client()
-        bucket = storage_client.bucket(BUCKET_NAME)
-
-        for file_name in file_names:
-            blob_path = f"certificates/{file_name}"
-            blob = bucket.blob(blob_path)
-
-            # Skip if not found
-            if not blob.exists():
-                print(f"⚠️ File not found in GCS: {blob_path}")
-                continue
-
-            start = time.time()
-            file_bytes = blob.download_as_bytes()
-            maintype, subtype = mimetypes.guess_type(file_name)[0].split("/", 1) if mimetypes.guess_type(file_name)[0] else ("application", "octet-stream")
-
-            msg.add_attachment(
-                file_bytes,
-                maintype=maintype,
-                subtype=subtype,
-                filename=file_name,
-            )
-            print(f"Attached {file_name}")
-
-        # --- Encode + Send ---
-        raw = base64.urlsafe_b64encode(msg.as_bytes()).decode()
-        # For testing, do NOT attach to thread; send as a new message
-        message = {"raw": raw}
-
-        start = time.time()
-        sent = (
-            service.users()
-            .messages()
-            .send(userId="me", body=message)
-            .execute()
-        )
-        print(f"[TIMING] Gmail messages.send: {time.time() - start:.2f}s")
-
-        print(f"Gmail API: sent message ID {sent.get('id')} in thread {thread_id}")
-        log_step(
-            "email_sent",
-            thread_id=thread_id,
-            data={
-                "to": to_emails,
-                "cc": cc_emails,
-                "message_id": sent.get('id'),
-                "files": file_names,
-            },
-        )
-        return True
-    except Exception as e:
-        print(f"Unexpected error: {e}")
-        log_step("email_send_failed", status="error", thread_id=thread_id, data={"to": to_emails, "cc": cc_emails}, error=str(e))
-        return False
-
-
 def normalize_recipient_list(items):
     res = []
     for x in items or []:
@@ -550,69 +451,119 @@ def normalize_recipient_list(items):
     return out
 
 
-@app.route("/", methods=["POST"])
-def coi_generator(request):
-    request_start = time.time()
-    data = request.get_json(force=True)
-    action = data.get("action")
+def create_draft_coi_reply(
+    thread_id: str,
+    to_emails: list[str],
+    cc_emails: list[str],
+    subject_text: str,
+    body_text: str,
+    file_names: list[str],
+    last_message_id: str | None = None,
+):
+    """
+    Creates a draft reply email in an existing Gmail thread (thread_id) via Tony's Workspace Gmail using
+    the no-reply alias. Attaches provided PDFs. Honors To/CC lists. Does NOT send the email.
+    """
+    try:
+        creds = get_gmail_credentials("tony@lioninsurance.us")
+        service = build("gmail", "v1", credentials=creds)
 
-    if action == "analyze_for_coi_request":
-        subject = data.get("subject")
-        content = data.get("body_text")
-        to_emails = data.get("to_emails")
-        cc_emails = data.get("cc_emails")
-        thread_id = data.get("thread_id")
-        log_step("llm_analysis_started", thread_id=thread_id, data={"subject": subject})
-        analysis = analyze_for_coi_request(subject, content)
-        log_step("llm_analysis_finished", thread_id=thread_id, data=analysis)
+        msg = EmailMessage()
+        if to_emails:
+            msg["To"] = ", ".join(to_emails)
+        if cc_emails:
+            msg["Cc"] = ", ".join(cc_emails)
+        # Send from no-reply alias
+        msg["From"] = "tony@lioninsurance.us"
+        msg["Subject"] = subject_text
+        if last_message_id:
+            msg["In-Reply-To"] = last_message_id
+            msg["References"] = last_message_id
+        msg.set_content(body_text)
 
-        if analysis['is_likely_coi_request']:
-            log_step("llm_infer_started", thread_id=thread_id)
-            inferred_data = infer_coi_request_info(subject, content, to_emails, cc_emails)
-            log_step("llm_infer_finished", thread_id=thread_id, data=inferred_data)
+        # --- Attach PDFs from GCS ---
+        storage_client = storage.Client()
+        bucket = storage_client.bucket(BUCKET_NAME)
 
-            print(f"[TIMING] Total analyze_for_coi_request: {time.time() - request_start:.2f}s")
-            return {
-                'is_likely_coi_request': True,
-                'insured_inferred': inferred_data['insured_inferred'],
-                'insured_name': inferred_data['insured_name'],
-                'holder_inferred': inferred_data['holder_inferred'],
-                'holder_name': inferred_data['holder_name'],
-                'holder_addr_1': inferred_data['holder_addr_1'],
-                'holder_addr_2': inferred_data['holder_addr_2'],
-                'send_to_email': inferred_data['send_to_email']
-            }
-        else:
-            print(f"[TIMING] Total analyze_for_coi_request: {time.time() - request_start:.2f}s")
-            return {
-                'is_likely_coi_request': False,
-                'insured_inferred': False,
-                'insured_name': '',
-                'holder_inferred': False,
-                'holder_name': '',
-                'holder_addr_1': '',
-                'holder_addr_2': '',
-                'send_to_email': ''
-            }
-    elif action == "generate_coi":
-        insured_inferred = data.get("insured_inferred")
-        insured_name = data.get("insured_name")
-        holder_name = data.get("holder_name")
-        holder_addr_1 = data.get("holder_addr_1")
-        holder_addr_2 = data.get("holder_addr_2")
-        send_to_email = data.get("send_to_email")
-        to_emails_incoming = data.get("to_emails", [])
-        cc_emails_incoming = data.get("cc_emails", [])
-        last_message_id = data.get("last_message_id")
-        thread_id = data.get("thread_id")
-        subject_text = data.get("subject_text")
-        body_text = data.get("body_text")
+        for file_name in file_names:
+            blob_path = f"certificates/{file_name}"
+            blob = bucket.blob(blob_path)
 
-        log_step("download_from_drive_started", thread_id=thread_id, data={"insured_name": insured_name})
-        file_names = download_from_drive(insured_name)
-        log_step("download_from_drive_finished", thread_id=thread_id, data={"files": file_names})
-        coi_holder = (holder_name, holder_addr_1, holder_addr_2)
-        main_file = next((f for f in file_names if "additional" not in f.lower()), None)
+            # Skip if not found
+            if not blob.exists():
+                print(f"⚠️ File not found in GCS: {blob_path}")
+                continue
+
+            start = time.time()
+            file_bytes = blob.download_as_bytes()
+            type_guess = mimetypes.guess_type(file_name)[0]
+            if type_guess:
+                maintype, subtype = type_guess.split("/", 1)
+            else:
+                maintype, subtype = "application", "octet-stream"
+
+            msg.add_attachment(
+                file_bytes,
+                maintype=maintype,
+                subtype=subtype,
+                filename=file_name,
+            )
+            print(f"Attached {file_name} to draft")
+
+        # --- Encode + Create Draft ---
+        raw = base64.urlsafe_b64encode(msg.as_bytes()).decode()
+        draft_message = {"message": {"raw": raw, "threadId": thread_id}} if thread_id else {"message": {"raw": raw}}
+
+        start = time.time()
+        draft = (
+            service.users()
+            .drafts()
+            .create(userId="me", body=draft_message)
+            .execute()
+        )
+        print(f"[TIMING] Gmail drafts.create: {time.time() - start:.2f}s")
+
+        print(f"Gmail API: created draft ID {draft.get('id')} in thread {thread_id}")
+        log_step(
+            "draft_created",
+            thread_id=thread_id,
+            data={
+                "to": to_emails,
+                "cc": cc_emails,
+                "draft_id": draft.get('id'),
+                "files": file_names,
+            },
+        )
+        return True
+    except Exception as e:
+        print(f"Unexpected error creating draft: {e}")
+        log_step("draft_create_failed", status="error", thread_id=thread_id, data={"to": to_emails, "cc": cc_emails}, error=str(e))
+        return False
+
+
+def generate_coi_files(
+    insured_name: str,
+    holder_name: str,
+    holder_addr_1: str,
+    holder_addr_2: str,
+    thread_id: str,
+):
+    """
+    Generate COI files by downloading from Drive, filling, signing, and flattening.
+    Returns list of generated file names.
+    """
+    log_step("download_from_drive_started", thread_id=thread_id, data={"insured_name": insured_name})
+    file_names = download_from_drive(insured_name)
+    log_step("download_from_drive_finished", thread_id=thread_id, data={"files": file_names})
+    
+    if not file_names:
+        log_step("no_files_found", status="error", thread_id=thread_id, data={"insured_name": insured_name})
+        return []
+    
+    coi_holder = (holder_name, holder_addr_1, holder_addr_2)
+    main_file = next((f for f in file_names if "additional" not in f.lower()), None)
+    
+    if main_file:
         log_step("coi_fill_started", thread_id=thread_id, data={"main_file": main_file, "holder": coi_holder})
         try:
             fill_coi(f'certificates/{main_file}', coi_holder)
@@ -633,36 +584,134 @@ def coi_generator(request):
                 log_step("additional_signature_flatten_finished", thread_id=thread_id, data={"file": add_file})
             except Exception as e:
                 log_step("additional_signature_flatten_failed", status="error", thread_id=thread_id, data={"file": add_file}, error=str(e))
-
-        orig_to = normalize_recipient_list(to_emails_incoming)
-        orig_cc = normalize_recipient_list(cc_emails_incoming)
-        inferred = (send_to_email or '').strip()
-
-        if inferred:
-            final_to = [inferred]
-            # everyone else to CC, excluding inferred and excluding from address
-            others = [e for e in orig_to + orig_cc if e.lower() != inferred.lower()]
-            final_cc = []
-            seen = set([inferred.lower()])
-            for e in others:
-                el = e.lower()
-                if el not in seen:
-                    seen.add(el)
-                    final_cc.append(e)
-        else:
-            final_to = orig_to
-            final_cc = [e for e in orig_cc if e.lower() not in {x.lower() for x in orig_to}]
-
-        send_coi(
-            thread_id=thread_id,
-            to_emails=final_to,
-            cc_emails=final_cc,
-            subject_text=subject_text,
-            body_text=body_text,
-            file_names=file_names,
-            last_message_id=last_message_id,
-        )
-        print(f"[TIMING] Total generate_coi: {time.time() - request_start:.2f}s")
-        return ("", 204)
     
-    return ("", 400)
+    return file_names
+
+
+def analyze_for_coi_request(data: dict):
+    """ Analyze email for COI request and generate COI files if necessary.
+
+    """
+    subject = data.get("subject")
+    content = data.get("body_text")
+    to_emails = data.get("to_emails")
+    cc_emails = data.get("cc_emails")
+    from_email = data.get("from_email")
+    thread_id = data.get("thread_id")
+    log_step("is_coi_request_started", thread_id=thread_id, data={"subject": subject})
+    analysis = is_coi_request(subject, content, from_email)
+    log_step("is_coi_request_finished", thread_id=thread_id, data=analysis)
+
+    if analysis['is_likely_coi_request']:
+        log_step("infer_coi_request_info_started", thread_id=thread_id)
+        inferred_data = infer_coi_request_info(subject, content, to_emails, cc_emails, from_email)
+        log_step("infer_coi_request_info_finished", thread_id=thread_id, data=inferred_data)
+
+        # If COI is detected and we have the necessary information, generate COI and create draft
+        if inferred_data.get('insured_name') and inferred_data.get('holder_name'):
+            
+            last_message_id = data.get("last_message_id")
+            
+            log_step("generate_coi_files_started", thread_id=thread_id, data={
+                "insured_name": inferred_data['insured_name'],
+                "holder_name": inferred_data['holder_name']
+            })
+
+            # Generate COI files
+            # TODO: TMP testing
+            """
+            file_names = generate_coi_files(
+                insured_name=inferred_data['insured_name'],
+                holder_name=inferred_data['holder_name'],
+                holder_addr_1=inferred_data['holder_addr_1'],
+                holder_addr_2=inferred_data['holder_addr_2'],
+                thread_id=thread_id
+            )
+            """
+            file_names = True
+
+            if file_names:
+                # Normalize recipient lists
+                orig_to = normalize_recipient_list(to_emails)
+                orig_cc = normalize_recipient_list(cc_emails)
+                inferred = (inferred_data.get('send_to_email') or '').strip()
+
+                if inferred:
+                    final_to = [inferred]
+                    # everyone else to CC, excluding inferred
+                    others = [e for e in orig_to + orig_cc if e.lower() != inferred.lower()]
+                    final_cc = []
+                    seen = set([inferred.lower()])
+                    for e in others:
+                        el = e.lower()
+                        if el not in seen:
+                            seen.add(el)
+                            final_cc.append(e)
+                else:
+                    # if not inferred send to the person who sent the email
+                    final_to = [from_email]
+                    final_cc = [e for e in orig_cc if e.lower() not in {x.lower() for x in orig_to}]
+
+                # Create draft reply email
+                subject_text = f"Re: {subject}"
+                body_text = "Hello,\nPlease see the COI attached."
+                
+                # TODO: TMP testing - Instead of creating draft, log to Firestore for monitoring
+                '''
+                create_draft_coi_reply(
+                    thread_id=thread_id,
+                    to_emails=final_to,
+                    cc_emails=final_cc,
+                    subject_text=subject_text,
+                    body_text=body_text,
+                    file_names=file_names,
+                    last_message_id=last_message_id,
+                )
+                '''
+                
+                # Log all COI generation data to Firestore for monitoring
+                try:
+                    doc_ref = db.collection("coi_generations").document(f"thread_{thread_id}")
+                    doc_ref.set({
+                        "thread_id": thread_id,
+                        "last_message_id": last_message_id,
+                        "timestamp": datetime.utcnow().isoformat(),
+                        "insured_name_inferred": inferred_data.get('insured_name'),
+                        "holder_name_inferred": inferred_data.get('holder_name'),
+                        "holder_addr_1_inferred": inferred_data.get('holder_addr_1'),
+                        "holder_addr_2_inferred": inferred_data.get('holder_addr_2'),
+                        "send_to_email_inferred": inferred_data.get('send_to_email'),
+                        "from_email": from_email,
+                        "subject": subject,
+                        "body_text": content,
+                        "original_to_emails": to_emails,
+                        "original_cc_emails": cc_emails,
+                        "final_to_emails": final_to,
+                        "final_cc_emails": final_cc,
+                    }, merge=False)
+                    print(f"[INFO] Logged COI generation data to Firestore for thread {thread_id}")
+                except Exception as e:
+                    print(f"[ERR] Failed to log COI generation data to Firestore: {e}")
+                    log_step("firestore_log_failed", status="error", thread_id=thread_id, error=str(e))
+                
+                log_step("generate_coi_files_completed", thread_id=thread_id, data={"files": file_names})
+            else:
+                log_step("generate_coi_files_failed", status="error", thread_id=thread_id, 
+                        data={"insured_name": inferred_data['insured_name']}, 
+                        error="No files found or generated")
+        else:
+            log_step("generate_coi_files_skipped", thread_id=thread_id,
+                    data={"reason": "Missing required information", "inferred_data": inferred_data})
+
+
+@app.route("/", methods=["POST"])
+def coi_generator(request):
+    start_time = time.time()
+    data = request.get_json(force=True)
+    action = data.get("action")
+
+    if action == "analyze_for_coi_request":
+        analyze_for_coi_request(data)
+        print(f"[TIMING] Total analyze_for_coi_request: {time.time() - start_time:.2f}s")
+
+    return ("", 200)

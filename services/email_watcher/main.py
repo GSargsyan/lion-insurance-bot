@@ -81,8 +81,6 @@ def get_gmail_credentials(user_email):
     return creds
 
 EMAILS = ['tony@lioninsurance.us']
-GMAILS = {email: build("gmail", "v1", credentials=get_gmail_credentials(email)) for email in EMAILS}
-
 
 def extract_text(payload):
     if "body" in payload and "data" in payload["body"]:
@@ -145,15 +143,18 @@ def handle_email(
     body_text: str,
     to_emails: list[str],
     cc_emails: list[str],
+    from_email: str,
     last_message_id: str
 ):
     """ Analyze email and do the required actions.
     Currently only supports COI request handling.
-
+ggVG
     """
     log_step("email_received", thread_id=thread_id, data={"subject": subject, "to": to_emails, "cc": cc_emails})
     # also persist the raw email body for later debugging
     log_step("email_body", thread_id=thread_id, data={"body_text": body_text})
+
+    print(f"[INFO] Analyzing email with subject: {subject}")
 
     try:
         start = time.time()
@@ -163,7 +164,9 @@ def handle_email(
             "subject": subject,
             "body_text": body_text,
             "to_emails": to_emails,
-            "cc_emails": cc_emails
+            "cc_emails": cc_emails,
+            "from_email": from_email,
+            "last_message_id": last_message_id
         }, timeout=30).json()
         print(f"[TIMING] COI Generator analyze_for_coi_request: {time.time() - start:.2f}s")
         log_step("coi_analysis_completed", thread_id=thread_id, data=analysis)
@@ -173,38 +176,10 @@ def handle_email(
         return
 
     if analysis['is_likely_coi_request']:
-        print(f"COI REQUEST DETECTED! Subject: {subject}")
-
-        # notify telegram bot about the coi request
-        payload = {
-            "thread_id": thread_id,
-            "subject": subject,
-            "chat_id": TELEGRAM_CHAT_ID,
-            "insured_inferred": analysis['insured_inferred'],
-            "insured_name": analysis['insured_name'],
-            "holder_inferred": analysis['holder_inferred'],
-            "holder_name": analysis['holder_name'],
-            "holder_addr_1": analysis['holder_addr_1'],
-            "holder_addr_2": analysis['holder_addr_2'],
-            "send_to_email": analysis['send_to_email'],
-            "to_emails": to_emails,
-            "cc_emails": cc_emails,
-            "last_message_id": last_message_id,
-        }
-
-        try:
-            start = time.time()
-            r = requests.post(TELEGRAM_CLOUD_RUN, json=payload, timeout=10)
-            r.raise_for_status()
-            print(f"[TIMING] Telegram bot notification: {time.time() - start:.2f}s")
-            log_step("telegram_notified", thread_id=thread_id, data={"subject": subject})
-            print(f"[OK] Notified Telegram bot for email '{subject}'")
-        except Exception as e:
-            log_step("telegram_notify_failed", status="error", thread_id=thread_id, data={"subject": subject}, error=str(e))
-            print(f"[ERR] Failed to notify Telegram bot: {e}")
+        print(f"[INFO] COI REQUEST DETECTED! Subject: {subject}")
     else:
         log_step("not_coi_request", thread_id=thread_id, data={"subject": subject})
-        print(f"not a coi request")
+        print(f"[INFO] Not a COI request")
 
 
 def get_latest_thread(gmail: build):
@@ -216,6 +191,9 @@ def get_latest_thread(gmail: build):
         userId="me",
         q="newer_than:1m to:me -from:me label:inbox",
         maxResults=3
+        # TODO: TMP testing
+        # q='subject:"CERT HOLDER" from:carriersetup@relyonrts.com label:inbox',
+        # maxResults=1
     ).execute().get("threads", [])
     print(f"[TIMING] Gmail threads.list: {time.time() - start:.2f}s")
 
@@ -229,8 +207,8 @@ def get_latest_thread(gmail: build):
         thread_id = t['id']
         start = time.time()
         thread = gmail.users().threads().get(userId="me", id=thread_id).execute()
-        print(f"[TIMING] Gmail threads.get: {time.time() - start:.2f}s")
         messages = thread.get('messages', [])
+
         for m in messages:
             try:
                 ts = int(m.get('internalDate', '0'))
@@ -251,10 +229,11 @@ def get_last_email_contents(msg_data):
     # get the emails in the to and cc's
     to_emails = next((h["value"] for h in headers if h["name"] == "To"), "").split(",")
     cc_emails = next((h["value"] for h in headers if h["name"] == "Cc"), "").split(",")
+    from_email = next((h["value"] for h in headers if h["name"] == "From"), "")
     
     body_text = extract_text(msg_data["payload"]) or msg_data.get("snippet", "")
     last_message_id = msg_data.get("id")
-    return subject, sender, body_text, to_emails, cc_emails, last_message_id
+    return subject, sender, body_text, to_emails, cc_emails, from_email, last_message_id
 
 
 @app.route("/", methods=["POST"])
@@ -267,35 +246,35 @@ def email_watcher(request):
     data = json.loads(base64.b64decode(msg["data"]).decode("utf-8"))
 
     user = data["emailAddress"]
-    gmail = GMAILS[user]
+    gmail = build("gmail", "v1", credentials=get_gmail_credentials("tony@lioninsurance.us"))
 
     thread = get_latest_thread(gmail)
+    if not thread:
+        return ("", 204)
+    
     thread_id = thread['id']
 
     # Acquire processing lock to avoid duplicate concurrent runs for the same thread
     if not acquire_processing_lock(thread_id):
         log_step("processing_lock_held", thread_id=thread_id, data={"note": "duplicate trigger skipped"})
+        print(f"[INFO] Thread with ID - {thread_id} is already processed, skipping!")
         return ("", 204)
     
     try:
         # Use the most recent message in the thread by internalDate
         messages = thread.get('messages', [])
         if not messages:
-            print(f"Thread with ID - {thread_id} has no messages, skipping!")
+            print(f"[INFO] Thread with ID - {thread_id} has no messages, skipping!")
             return ("", 204)
         msg_data = max(messages, key=lambda m: int(m.get('internalDate', '0')))
-        subject, sender, body_text, to_emails, cc_emails, last_message_id = get_last_email_contents(msg_data)
-        # print the last thread message subject for debugging
-        print(f"******** Last thread message subject: {subject}")
+        subject, sender, body_text, to_emails, cc_emails, from_email, last_message_id = get_last_email_contents(msg_data)
 
         if thread_id == get_last_processed_id():
-            print(f"Thread with ID - {thread_id} is already processed, skipping!")
+            print(f"[INFO] Thread with ID - {thread_id} is already processed, skipping!")
             return ("", 204)
 
-        handle_email(thread_id, user, subject, body_text, to_emails, cc_emails, last_message_id)
+        handle_email(thread_id, user, subject, body_text, to_emails, cc_emails, from_email, last_message_id)
         
-        # Send notification payload including recipient lists and last message id
-        # (This mirrors existing call inside handle_email, but ensures propagation to Telegram bot)
         save_last_processed_id(thread_id)
     finally:
         release_processing_lock(thread_id)

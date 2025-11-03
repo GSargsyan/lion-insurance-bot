@@ -130,6 +130,18 @@ def handle_callback(data):
         send_message(chat_id, f"🚫 Skipped COI for:\n*{subject or thread_id}*")
 
 
+def format_email_lists(to_emails, cc_emails):
+    """Format To and CC email lists for Telegram message."""
+    parts = []
+    if to_emails:
+        to_str = ", ".join(to_emails)
+        parts.append(f"To: {to_str}")
+    if cc_emails:
+        cc_str = ", ".join(cc_emails)
+        parts.append(f"Cc: {cc_str}")
+    return "\n".join(parts) if parts else ""
+
+
 def notify_about_coi_request(data):
     """ Called when email was detected as a COI request.
     Will send the user a message with a button to approve or reject sending the COI.
@@ -157,14 +169,21 @@ def notify_about_coi_request(data):
         "timestamp": datetime.utcnow().isoformat()
     })
 
+    # Format To/CC email lists
+    email_lists_text = format_email_lists(data.get("to_emails", []), data.get("cc_emails", []))
+
     if not data["insured_inferred"]:
         text = (f"Email likely a COI request:\n*{data['subject']}*\n\n"
                 "🚨 Could not infer insured name, please check manually")
+        if email_lists_text:
+            text += f"\n\n{email_lists_text}"
         send_message(data["chat_id"], text)
 
     elif not data["holder_inferred"]:
         text = (f"Email likely a COI request:\n*{data['subject']}*\n\n"
                 "🚨 Could not infer holder name, please check manually")
+        if email_lists_text:
+            text += f"\n\n{email_lists_text}"
         send_message(data["chat_id"], text)
     else:
         buttons = [[
@@ -185,6 +204,9 @@ def notify_about_coi_request(data):
             f"Email likely a COI request:\n*{data['subject']}*\n\n"
             f"{info_text}"
         )
+        
+        if email_lists_text:
+            message_text += f"\n\n{email_lists_text}"
 
         send_message(data["chat_id"], message_text, buttons)
 
