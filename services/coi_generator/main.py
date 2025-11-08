@@ -23,6 +23,8 @@ from email.message import EmailMessage
 from openai import OpenAI
 
 
+from clients import INSURED_COMPANY_NAMES
+
 app = Flask(__name__)
 
 db = firestore.Client(database='lion-ins')
@@ -291,22 +293,25 @@ def is_coi_request(subject: str, content: str, from_email: str):
     Your task is to analyze weather the email asks for certificate of insurance (is a COI request) or no.
     When they ask for a COI, they also specify certificate holder name and address, but sometimes they just write company name,
     not mentioning that it's the COI holder.
-    Typically, but not always brockers and clients send a request, with texts such as:
-      - please send insurance
-      - coi needed
-      - urgent, load on hold
-      - ins cert request
-      - proof of insurance needed
+    A COI request is an email that explicitly or implicitly asks for an insurance certificate.
+    Common examples:
+    - "please send insurance"
+    - "need COI"
+    - "load on hold until we receive insurance"
+    - "proof of insurance needed"
+    - "certificate holder is..."
+
+    Typically but not always brokers are the ones asking for a COI, or our client asks for it giving broker details.
     
     Respond with ONLY a valid JSON object in this exact format:
     {{"is_likely_coi_request": true/false}}
     
     Be conservative - only return true if there are clear indicators of a COI request and
-    there is clear indication of the certificate holder, broker name and address.
+    there is clear indication of the certificate holder, name and address.
 
     Cases to return false
-    1. If the sender is from coi@lioninsurance.us and the body hints that a COI was already made by us and is being sent
-    2. If the sender is from the Certificial (company that sends COI requests, but we don't work with them)
+    1. If the sender (From email) is coi@lioninsurance.us and the body hints that a COI was already made by us and is being sent
+    2. If the exact name "Certificial" appears in the body or subject (company that sends COI requests, but we don't work with them)
     
     From email: {from_email}
     Subject: {subject}
@@ -318,7 +323,7 @@ def is_coi_request(subject: str, content: str, from_email: str):
         model="gpt-4o-mini",
         response_format={"type": "json_object"},
         messages=[
-            {"role": "system", "content": "You are a commercial trucking insurance email monitoring bot."},
+            {"role": "system", "content": "You are a commercial trucking insurance agency's email monitoring bot. The name of our company is Lion Insurance Services."},
             {"role": "user", "content": prompt}
         ]
     ).choices[0].message.content
@@ -343,56 +348,69 @@ def is_coi_request(subject: str, content: str, from_email: str):
 
 def infer_coi_request_info(subject: str, content: str, to_emails: list[str], cc_emails: list[str], from_email: str):
     prompt = f"""
-    You are given a raw Certificate of Insurance (COI) request email subject and body.
+    You are monitoring the email address tony@lioninsurance.us for COI requests, the results you return will be used to automatically send the COI to the appropriate email addresses.
+    You are given an incoming email, which was marked as a 'likely' COI request.
+    Your task is to analyze whether the email indeed asks for certificate of insurance, i.e. is a COI request, and extract the necessary information.
+    When they ask for a COI, they also specify certificate holder name and address, but sometimes they just write holder's name and address,
+    not mentioning that it's the COI holder.
     Your task is to analyze the email, infer and extract the following information:
-        1. Weather the insured client/company name for which the client or the broker asks for COI is mentioned in the email.
-        2. The insured client/company name for which the client or the broker asks for COI. Leave it blank if you can't infer it.
-        3. The certificate holder information, which consists of:
-            a. The name of their company.
-            b. Address line 1 (just the street address).
-            c. Address line 2 with the format: <city>, <state 2 letter code> <zip code>.
-        4. Try to infer the main email address that the COI needs to be sent to. This may be in the body, to's or cc's.
-           Holder name might give a clue on who to send the COI to. Leave it blank if you can't infer it.
+        1. "insured_name": The insured client/company name for which the client or the broker asks for COI.
+        2. "holder_name": The certificate holder information, which consists of:
+            a. "holder_name": The name of their company.
+            b. "holder_addr_1": Address line 1 (just the street address).
+            c. "holder_addr_2": Address line 2 with the format: <city>, <state 2 letter code> <zip code>.
+        3. "to_emails": Try to infer the main email address(es) that the COI needs to be sent to.
+           This may be in the body, To's or CC's. If there is only client's email, then needs to be sent to the client, otherwise it's the broker or other agency that needs to be sent to.
+           This cannot be one of our email addresses: (coi@lioninsurance.us, tony@lioninsurance.us, etc..). Leave it empty if you can't infer it.
+           Holder name might give a clue on who to send the COI to. If you can't infer, then it is "Original From Email".
+        4. "cc_emails": Try to infer the email addresses that should be CC'd. Usually CC's are the following:
+           The email you are monitoring is tony@lioninsurance.us, so you don't need to CC him,
+           but if other lioninsurance.us emails are in the CC's or To's, include them so when we automatically send the COI, they are also notified.
+           If there is client's email present in the "Original To Emails" or "Original CC Emails", always include the client's email in the CC's.
+           So they know we are sending the COI to the requested email addresses.
     
-    Respond with ONLY a valid JSON object in the exact format:
+    Respond with ONLY a valid JSON object, with the following keys.
+    If the email is not a COI request, leave the values empty strings.
+    If the email is coming from coi@lioninsurance.us, tony@lioninsurance.us, etc.., leave the values empty strings. It's not a COI request.
+
+    Respond in this exact format:
     {{
         "insured_name": string,
         "holder_name": string,
         "holder_addr_1": string,
         "holder_addr_2": string,
-        "send_to_email": string
+        "to_emails_inferred": list[string],
+        "cc_emails_inferred": list[string]
     }}
 
     Example:
     {{
-        "insured_name": "RAPID TRUCKING INC",
+        "insured_name": "PUMPKEN TRUCKING LLC",
         "holder_name": "Highway App, Inc.",
         "holder_addr_1": "5931 Greenville Ave, Unit #5620",
         "holder_addr_2": "Dallas, TX 75206",
-        "send_to_email": "insurance@certs.highway.com"
+        "to_emails_inferred": ["insurance@certs.highway.com"],
+        "cc_emails_inferred": ["pumpken_trucking@yahoo.com"]
     }}
 
-    Here is the email you need to analyze:
-    
-    To emails: {", ".join(to_emails)}
-    CC emails: {", ".join(cc_emails)}
-    From email: {from_email}
+    Here is the list of all our client names (insured companies), so you don't mix up holder and insured names.
+    {INSURED_COMPANY_NAMES}
+
+    And finally this is the email you need to analyze:
+
+    Original To Emails: {", ".join(to_emails)}
+    Original CC Emails: {", ".join(cc_emails)}
+    Original From Email: {from_email}
     Subject: {subject}
     Content: {content}
     """
-    
-    '''
-    response = GEMINI_CLIENT.models.generate_content( 
-        model="gemini-2.5-flash-preview-05-20",
-        contents=prompt 
-    )
-    '''
+
     start = time.time()
     response = OPENAI_CLIENT.chat.completions.create(
         model="gpt-5-mini",
         response_format={"type": "json_object"},
         messages=[
-            {"role": "system", "content": "You are a commercial trucking insurance agency COI handling bot."},
+            {"role": "system", "content": "You are a commercial trucking insurance agency's email monitoring bot. The name of our company is Lion Insurance Services."},
             {"role": "user", "content": prompt}
         ]
     ).choices[0].message.content
@@ -429,28 +447,6 @@ def get_gmail_credentials(user_email: str):
     return creds
 
 
-def normalize_recipient_list(items):
-    res = []
-    for x in items or []:
-        if not x:
-            continue
-        # strip display names if present
-        addr = x.strip()
-        if '<' in addr and '>' in addr:
-            addr = addr[addr.find('<')+1:addr.find('>')]
-        addr = addr.strip()
-        if addr:
-            res.append(addr)
-    # dedupe preserving order
-    seen = set()
-    out = []
-    for a in res:
-        if a.lower() not in seen:
-            seen.add(a.lower())
-            out.append(a)
-    return out
-
-
 def create_draft_coi_reply(
     thread_id: str,
     to_emails: list[str],
@@ -473,8 +469,8 @@ def create_draft_coi_reply(
             msg["To"] = ", ".join(to_emails)
         if cc_emails:
             msg["Cc"] = ", ".join(cc_emails)
-        # Send from no-reply alias
-        msg["From"] = "tony@lioninsurance.us"
+        # Send from no-reply alias with display name
+        msg["From"] = "Tony Lion Insurance <tony@lioninsurance.us>"
         msg["Subject"] = subject_text
         if last_message_id:
             msg["In-Reply-To"] = last_message_id
@@ -594,8 +590,8 @@ def analyze_for_coi_request(data: dict):
     """
     subject = data.get("subject")
     content = data.get("body_text")
-    to_emails = data.get("to_emails")
-    cc_emails = data.get("cc_emails")
+    original_to_emails = data.get("to_emails")
+    original_cc_emails = data.get("cc_emails")
     from_email = data.get("from_email")
     thread_id = data.get("thread_id")
     log_step("is_coi_request_started", thread_id=thread_id, data={"subject": subject})
@@ -604,11 +600,14 @@ def analyze_for_coi_request(data: dict):
 
     if analysis['is_likely_coi_request']:
         log_step("infer_coi_request_info_started", thread_id=thread_id)
-        inferred_data = infer_coi_request_info(subject, content, to_emails, cc_emails, from_email)
+        inferred_data = infer_coi_request_info(subject, content, original_to_emails, original_cc_emails, from_email)
         log_step("infer_coi_request_info_finished", thread_id=thread_id, data=inferred_data)
 
         # If COI is detected and we have the necessary information, generate COI and create draft
-        if inferred_data.get('insured_name') and inferred_data.get('holder_name'):
+        if inferred_data.get('insured_name') and \
+            inferred_data.get('holder_name') and \
+            inferred_data.get('holder_addr_1') and \
+            inferred_data.get('holder_addr_2'):
             
             last_message_id = data.get("last_message_id")
             
@@ -618,8 +617,6 @@ def analyze_for_coi_request(data: dict):
             })
 
             # Generate COI files
-            # TODO: TMP testing
-            """
             file_names = generate_coi_files(
                 insured_name=inferred_data['insured_name'],
                 holder_name=inferred_data['holder_name'],
@@ -627,47 +624,24 @@ def analyze_for_coi_request(data: dict):
                 holder_addr_2=inferred_data['holder_addr_2'],
                 thread_id=thread_id
             )
-            """
-            file_names = True
 
             if file_names:
-                # Normalize recipient lists
-                orig_to = normalize_recipient_list(to_emails)
-                orig_cc = normalize_recipient_list(cc_emails)
-                inferred = (inferred_data.get('send_to_email') or '').strip()
-
-                if inferred:
-                    final_to = [inferred]
-                    # everyone else to CC, excluding inferred
-                    others = [e for e in orig_to + orig_cc if e.lower() != inferred.lower()]
-                    final_cc = []
-                    seen = set([inferred.lower()])
-                    for e in others:
-                        el = e.lower()
-                        if el not in seen:
-                            seen.add(el)
-                            final_cc.append(e)
-                else:
-                    # if not inferred send to the person who sent the email
-                    final_to = [from_email]
-                    final_cc = [e for e in orig_cc if e.lower() not in {x.lower() for x in orig_to}]
+                final_to_emails = inferred_data.get('to_emails_inferred', [])
+                final_cc_emails = inferred_data.get('cc_emails_inferred', [])
 
                 # Create draft reply email
                 subject_text = f"Re: {subject}"
                 body_text = "Hello,\nPlease see the COI attached."
                 
-                # TODO: TMP testing - Instead of creating draft, log to Firestore for monitoring
-                '''
                 create_draft_coi_reply(
                     thread_id=thread_id,
-                    to_emails=final_to,
-                    cc_emails=final_cc,
+                    to_emails=final_to_emails,
+                    cc_emails=final_cc_emails,
                     subject_text=subject_text,
                     body_text=body_text,
                     file_names=file_names,
                     last_message_id=last_message_id,
                 )
-                '''
                 
                 # Log all COI generation data to Firestore for monitoring
                 try:
@@ -680,14 +654,13 @@ def analyze_for_coi_request(data: dict):
                         "holder_name_inferred": inferred_data.get('holder_name'),
                         "holder_addr_1_inferred": inferred_data.get('holder_addr_1'),
                         "holder_addr_2_inferred": inferred_data.get('holder_addr_2'),
-                        "send_to_email_inferred": inferred_data.get('send_to_email'),
+                        "to_emails_inferred": inferred_data.get('to_emails_inferred'),
+                        "cc_emails_inferred": inferred_data.get('cc_emails_inferred'),
                         "from_email": from_email,
                         "subject": subject,
                         "body_text": content,
-                        "original_to_emails": to_emails,
-                        "original_cc_emails": cc_emails,
-                        "final_to_emails": final_to,
-                        "final_cc_emails": final_cc,
+                        "original_to_emails": original_to_emails,
+                        "original_cc_emails": original_cc_emails,
                     }, merge=False)
                     print(f"[INFO] Logged COI generation data to Firestore for thread {thread_id}")
                 except Exception as e:
