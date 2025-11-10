@@ -14,8 +14,6 @@ from google.cloud import firestore
 
 app = Flask(__name__)
 
-# TODO: Create another scheduled cloud run to periodically register gmail watch
-
 # TODO: change id
 TELEGRAM_CHAT_ID = 828259521 # Grig
 # TODO: check url
@@ -31,6 +29,8 @@ db = firestore.Client(database='lion-ins')
 FSTORE_COLLECTION = "email_state"
 FSTORE_DOCUMENT = "last_processed"
 PROCESSING_COLLECTION = "email_processing_locks"
+
+COI_GENERATOR_CLOUD_RUN = 'https://coi-generator-142497757030.us-west1.run.app'
 
 # Centralized Firestore step logger for observability across the flow
 def log_step(step: str, status: str = "ok", thread_id: str | None = None, data: dict | None = None, error: str | None = None):
@@ -64,10 +64,6 @@ def log_step(step: str, status: str = "ok", thread_id: str | None = None, data: 
     except Exception as e:
         # As a fallback, still print so we don't lose the context entirely
         print(f"[OBS-ERR] Failed to log step '{step}': {e}")
-
-# setup the common service cloud run url
-# TODO: check url
-COI_GENERATOR_CLOUD_RUN = 'https://coi-generator-142497757030.us-west1.run.app'
 
 
 def get_gmail_credentials(user_email):
@@ -148,38 +144,27 @@ def handle_email(
 ):
     """ Analyze email and do the required actions.
     Currently only supports COI request handling.
-ggVG
+
     """
     log_step("email_received", thread_id=thread_id, data={"subject": subject, "to": to_emails, "cc": cc_emails})
-    # also persist the raw email body for later debugging
     log_step("email_body", thread_id=thread_id, data={"body_text": body_text})
 
     print(f"[INFO] Analyzing email with subject: {subject}")
 
-    try:
-        start = time.time()
-        analysis = requests.post(COI_GENERATOR_CLOUD_RUN, json={
-            "action": "analyze_for_coi_request",
-            "thread_id": thread_id,
-            "subject": subject,
-            "body_text": body_text,
-            "to_emails": to_emails,
-            "cc_emails": cc_emails,
-            "from_email": from_email,
-            "last_message_id": last_message_id
-        }, timeout=30).json()
-        print(f"[TIMING] COI Generator analyze_for_coi_request: {time.time() - start:.2f}s")
-        log_step("coi_analysis_completed", thread_id=thread_id, data=analysis)
-    except Exception as e:
-        log_step("coi_analysis_failed", status="error", thread_id=thread_id, data={"subject": subject}, error=str(e))
-        print(f"[ERR] analyze_for_coi_request failed: {e}")
-        return
+    start = time.time()
+    requests.post(COI_GENERATOR_CLOUD_RUN, json={
+        "action": "analyze_for_coi_request",
+        "thread_id": thread_id,
+        "subject": subject,
+        "body_text": body_text,
+        "to_emails": to_emails,
+        "cc_emails": cc_emails,
+        "from_email": from_email,
+        "last_message_id": last_message_id
+    }, timeout=30)
+    print(f"[TIMING] COI Generator analyze_for_coi_request: {time.time() - start:.2f}s")
 
-    if analysis['is_likely_coi_request']:
-        print(f"[INFO] COI REQUEST DETECTED! Subject: {subject}")
-    else:
-        log_step("not_coi_request", thread_id=thread_id, data={"subject": subject})
-        print(f"[INFO] Not a COI request")
+    log_step("coi_analysis_completed", thread_id=thread_id)
 
 
 def get_latest_thread(gmail: build):
@@ -193,6 +178,7 @@ def get_latest_thread(gmail: build):
         maxResults=3
         # TODO: TMP testing
         # q='subject:"CERT HOLDER" from:carriersetup@relyonrts.com label:inbox',
+        # q='subject:"Certificate of Insurance - MM EXPRESS INC * 1732307*" label:inbox',
         # maxResults=1
     ).execute().get("threads", [])
     print(f"[TIMING] Gmail threads.list: {time.time() - start:.2f}s")
@@ -276,6 +262,10 @@ def email_watcher(request):
         handle_email(thread_id, user, subject, body_text, to_emails, cc_emails, from_email, last_message_id)
         
         save_last_processed_id(thread_id)
+    except Exception as e:
+        log_step("email_watcher_failed", status="error", thread_id=thread_id, error=str(e))
+        print(f"[ERR] email_watcher failed: {e}")
+        return ("", 204)
     finally:
         release_processing_lock(thread_id)
 

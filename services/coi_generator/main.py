@@ -22,9 +22,6 @@ from pypdf import PdfReader, PdfWriter
 from email.message import EmailMessage
 from openai import OpenAI
 
-
-from clients import INSURED_COMPANY_NAMES
-
 app = Flask(__name__)
 
 db = firestore.Client(database='lion-ins')
@@ -35,10 +32,12 @@ GMAIL_SCOPES = ["https://www.googleapis.com/auth/gmail.send", "https://www.googl
 
 # Define the scope to access to search and download files
 DRIVE_SCOPES = ["https://www.googleapis.com/auth/drive.readonly"]
-DRIVE_FOLDER_ID = "1KIeq3LHWWklQBanmADUz6XVYodlF2id6"  # Drive folder
+DRIVE_CERTS_FOLDER_ID = "1KIeq3LHWWklQBanmADUz6XVYodlF2id6"  # Drive folder
 BUCKET_NAME = "lion-insurance"  # Cloud Storage bucket name
 storage_client = storage.Client()
 BUCKET = storage_client.bucket(BUCKET_NAME)
+CLIENTS_JSON_BLOB = "coi_bot/clients.json"
+LOCAL_CLIENTS_JSON_PATH = os.path.join(os.path.dirname(__file__), "clients.json")
 
 # Centralized Firestore step logger for observability across the flow
 def log_step(step: str, status: str = "ok", thread_id: str | None = None, data: dict | None = None, error: str | None = None):
@@ -89,6 +88,55 @@ def get_gmail_credentials(user_email: str):
     return creds
 
 
+def _parse_clients_mapping(data) -> list[str]:
+    roster: list[str] = []
+    if isinstance(data, dict):
+        for name, email in data.items():
+            name_str = str(name).strip()
+            if not name_str:
+                continue
+            if email:
+                roster.append(f"{name_str} | {email}")
+            else:
+                roster.append(f"{name_str} | (no signer email yet)")
+    elif isinstance(data, list):
+        for item in data:
+            item_str = str(item).strip()
+            if item_str:
+                roster.append(item_str)
+    return roster
+
+
+def _load_local_clients_roster() -> list[str]:
+    try:
+        if not os.path.exists(LOCAL_CLIENTS_JSON_PATH):
+            return []
+        with open(LOCAL_CLIENTS_JSON_PATH, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        return _parse_clients_mapping(data)
+    except Exception as exc:
+        print(f"[WARN] Failed to load local clients roster: {exc}")
+        return []
+
+
+def load_clients_roster() -> list[str]:
+    """Load client roster from GCS; fallback to local JSON file if unavailable."""
+    try:
+        blob = BUCKET.blob(CLIENTS_JSON_BLOB)
+        if not blob.exists():
+            raise FileNotFoundError("Remote clients roster not found in GCS.")
+
+        raw_text = blob.download_as_text()
+        data = json.loads(raw_text)
+
+        roster = _parse_clients_mapping(data)
+        if roster:
+            return roster
+    except Exception as exc:
+        print(f"[WARN] Failed to load clients roster from GCS: {exc}")
+    return _load_local_clients_roster()
+
+
 def download_from_drive(insured: str):
     res = []
 
@@ -97,7 +145,7 @@ def download_from_drive(insured: str):
     drive_service = build("drive", "v3", credentials=creds)
 
     # --- Search for matching PDFs in Drive ---
-    query = (f"name contains '{insured}' and '{DRIVE_FOLDER_ID}' "
+    query = (f"name contains '{insured}' and '{DRIVE_CERTS_FOLDER_ID}' "
              f"in parents")
     start = time.time()
     results = drive_service.files().list(
@@ -347,6 +395,9 @@ def is_coi_request(subject: str, content: str, from_email: str):
 
 
 def infer_coi_request_info(subject: str, content: str, to_emails: list[str], cc_emails: list[str], from_email: str):
+    clients_roster = load_clients_roster()
+    clients_text = "\n".join(clients_roster)
+
     prompt = f"""
     You are monitoring the email address tony@lioninsurance.us for COI requests, the results you return will be used to automatically send the COI to the appropriate email addresses.
     You are given an incoming email, which was marked as a 'likely' COI request.
@@ -359,15 +410,17 @@ def infer_coi_request_info(subject: str, content: str, to_emails: list[str], cc_
             a. "holder_name": The name of their company.
             b. "holder_addr_1": Address line 1 (just the street address).
             c. "holder_addr_2": Address line 2 with the format: <city>, <state 2 letter code> <zip code>.
-        3. "to_emails": Try to infer the main email address(es) that the COI needs to be sent to.
+        3. "to_emails_inferred": Try to infer the main email address(es) that the COI needs to be sent to.
            This may be in the body, To's or CC's. If there is only client's email, then needs to be sent to the client, otherwise it's the broker or other agency that needs to be sent to.
            This cannot be one of our email addresses: (coi@lioninsurance.us, tony@lioninsurance.us, etc..). Leave it empty if you can't infer it.
            Holder name might give a clue on who to send the COI to. If you can't infer, then it is "Original From Email".
-        4. "cc_emails": Try to infer the email addresses that should be CC'd. Usually CC's are the following:
+           There should be only single email in this field, unless they specify to be sent to multiple emails.
+        4. "cc_emails_inferred": Try to infer the email addresses that should be CC'd. Usually CC's are the following:
            The email you are monitoring is tony@lioninsurance.us, so you don't need to CC him,
            but if other lioninsurance.us emails are in the CC's or To's, include them so when we automatically send the COI, they are also notified.
-           If there is client's email present in the "Original To Emails" or "Original CC Emails", always include the client's email in the CC's.
-           So they know we are sending the COI to the requested email addresses.
+           If there is client's email present in the "Original To Emails" or "Original CC Emails", always include the client's email in the CC's,
+           so they know we are sending the COI to the requested email addresses.
+           If you decide not to include the 'From Email' in the 'to_emails_inferred', then for sure include it in the 'cc_emails_inferred', so it's not lost.
     
     Respond with ONLY a valid JSON object, with the following keys.
     If the email is not a COI request, leave the values empty strings.
@@ -393,8 +446,8 @@ def infer_coi_request_info(subject: str, content: str, to_emails: list[str], cc_
         "cc_emails_inferred": ["pumpken_trucking@yahoo.com"]
     }}
 
-    Here is the list of all our client names (insured companies), so you don't mix up holder and insured names.
-    {INSURED_COMPANY_NAMES}
+    Here is the list of all our client names (insured companies) with known signer emails when available, to help you avoid mixing holder and insured names:
+    {clients_text}
 
     And finally this is the email you need to analyze:
 
@@ -404,6 +457,11 @@ def infer_coi_request_info(subject: str, content: str, to_emails: list[str], cc_
     Subject: {subject}
     Content: {content}
     """
+
+    # TODO: debugging prompt
+    print(f"------- PROMPT -------")
+    print(prompt)
+    print("------- PROMPT -------")
 
     start = time.time()
     response = OPENAI_CLIENT.chat.completions.create(
