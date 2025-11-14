@@ -176,9 +176,8 @@ def get_latest_thread(gmail: build):
         userId="me",
         q="newer_than:1m to:me -from:me label:inbox",
         maxResults=3
-        # TODO: TMP testing
+        # For debugging
         # q='subject:"CERT HOLDER" from:carriersetup@relyonrts.com label:inbox',
-        # q='subject:"Certificate of Insurance - MM EXPRESS INC * 1732307*" label:inbox',
         # maxResults=1
     ).execute().get("threads", [])
     print(f"[TIMING] Gmail threads.list: {time.time() - start:.2f}s")

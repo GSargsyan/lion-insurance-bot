@@ -1,2 +1,2 @@
 secrets/*
-services/coi_generator/clients.py
+services/coi_generator/clients.json

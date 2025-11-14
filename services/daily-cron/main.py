@@ -195,8 +195,7 @@ def gather_clients_emails_mapping():
     for company in cleaned_company_names:
         email = find_signer_email_for_company(gmail, company)
 
-        if email:
-            results[company] = email
+        results[company] = email
 
         doc_ref = DB.collection("clients_emails_mapping").document(company)
         doc_ref.set({

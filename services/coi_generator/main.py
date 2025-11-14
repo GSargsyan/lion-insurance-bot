@@ -98,7 +98,7 @@ def _parse_clients_mapping(data) -> list[str]:
             if email:
                 roster.append(f"{name_str} | {email}")
             else:
-                roster.append(f"{name_str} | (no signer email yet)")
+                roster.append(f"{name_str} | (no main email yet)")
     elif isinstance(data, list):
         for item in data:
             item_str = str(item).strip()
@@ -457,11 +457,6 @@ def infer_coi_request_info(subject: str, content: str, to_emails: list[str], cc_
     Subject: {subject}
     Content: {content}
     """
-
-    # TODO: debugging prompt
-    print(f"------- PROMPT -------")
-    print(prompt)
-    print("------- PROMPT -------")
 
     start = time.time()
     response = OPENAI_CLIENT.chat.completions.create(
