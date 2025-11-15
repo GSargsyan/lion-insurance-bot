@@ -14,9 +14,6 @@ from google.cloud import firestore
 
 app = Flask(__name__)
 
-# TODO: change id
-TELEGRAM_CHAT_ID = 828259521 # Grig
-# TODO: check url
 TELEGRAM_CLOUD_RUN = 'https://telegram-bot-142497757030.us-west1.run.app'
 
 GMAIL_SECRET = os.environ.get("SECRET_NAME", "gmail-service-account")
