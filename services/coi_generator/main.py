@@ -33,6 +33,10 @@ GMAIL_SCOPES = ["https://www.googleapis.com/auth/gmail.send", "https://www.googl
 # Define the scope to access to search and download files
 DRIVE_SCOPES = ["https://www.googleapis.com/auth/drive.readonly"]
 DRIVE_CERTS_FOLDER_ID = "1KIeq3LHWWklQBanmADUz6XVYodlF2id6"  # Drive folder
+# Google Sheets scope for reading autosend companies
+SHEETS_SCOPES = ["https://www.googleapis.com/auth/spreadsheets.readonly"]
+AUTOSEND_SHEET_FOLDER_ID = "1fVwJMenkghWlDW7LPlYXup_zwz8ZkQKj"  # Drive folder containing autosend sheet
+AUTOSEND_SHEET_NAME = "autosend_companies"  # Name of the Google Sheet
 BUCKET_NAME = "lion-insurance"  # Cloud Storage bucket name
 storage_client = storage.Client()
 BUCKET = storage_client.bucket(BUCKET_NAME)
@@ -77,15 +81,6 @@ def get_openai_key():
 
 OPENAI_CLIENT = OpenAI(api_key=get_openai_key())
 
-def get_gmail_credentials(user_email: str):
-    sm_client = secretmanager.SecretManagerServiceClient()
-    name = f"projects/lionins/secrets/{GMAIL_SECRET}/versions/latest"
-    secret = sm_client.access_secret_version(request={"name": name})
-    sa_info = json.loads(secret.payload.data.decode("utf-8"))
-    creds = service_account.Credentials.from_service_account_info(
-        sa_info, scopes=GMAIL_SCOPES, subject=user_email
-    )
-    return creds
 
 
 def _parse_clients_mapping(data) -> list[str]:
@@ -135,6 +130,67 @@ def load_clients_roster() -> list[str]:
     except Exception as exc:
         print(f"[WARN] Failed to load clients roster from GCS: {exc}")
     return _load_local_clients_roster()
+
+
+def load_autosend_companies() -> set[str]:
+    """Load autosend companies from Google Sheet. Returns a set of insured names (normalized, without .pdf)."""
+    try:
+        # Use the Cloud Run service account credentials
+        creds, _ = default(scopes=SHEETS_SCOPES + DRIVE_SCOPES)
+        drive_service = build("drive", "v3", credentials=creds)
+        sheets_service = build("sheets", "v4", credentials=creds)
+
+        # Search for the sheet by name in the specified folder
+        query = f"name='{AUTOSEND_SHEET_NAME}' and '{AUTOSEND_SHEET_FOLDER_ID}' in parents and mimeType='application/vnd.google-apps.spreadsheet'"
+        results = drive_service.files().list(
+            q=query,
+            pageSize=1,
+            fields="files(id, name)",
+        ).execute()
+
+        items = results.get("files", [])
+        if not items:
+            print(f"[WARN] Autosend sheet '{AUTOSEND_SHEET_NAME}' not found in folder {AUTOSEND_SHEET_FOLDER_ID}")
+            return set()
+
+        sheet_id = items[0]["id"]
+        print(f"[INFO] Found autosend sheet: {items[0]['name']} (ID: {sheet_id})")
+
+        # Read column A (Insured Name) from the sheet
+        range_name = "A:A"  # Read entire column A
+        result = sheets_service.spreadsheets().values().get(
+            spreadsheetId=sheet_id,
+            range=range_name,
+        ).execute()
+
+        values = result.get("values", [])
+        if not values:
+            print("[WARN] Autosend sheet is empty")
+            return set()
+
+        # Extract insured names from column A (skip header row if present)
+        # Normalize: strip whitespace, remove .pdf extension if present, convert to lowercase for comparison
+        autosend_set = set()
+        start_idx = 0
+        if len(values) > 0 and len(values[0]) > 0 and values[0][0].strip().lower() == "insured name":
+            start_idx = 1  # Skip header row
+
+        for row in values[start_idx:]:
+            if row and row[0]:  # Check if row exists and has a value
+                name = str(row[0]).strip()
+                if name:
+                    # Remove .pdf extension if present and normalize
+                    if name.lower().endswith(".pdf"):
+                        name = name[:-4]
+                    autosend_set.add(name)
+        
+        print(f"[INFO] Loaded {len(autosend_set)} autosend companies from sheet")
+        return autosend_set
+
+    except Exception as exc:
+        print(f"[WARN] Failed to load autosend companies from Google Sheet: {exc}")
+        log_step("autosend_load_failed", status="error", error=str(exc))
+        return set()
 
 
 def download_from_drive(insured: str):
@@ -421,6 +477,7 @@ def infer_coi_request_info(subject: str, content: str, to_emails: list[str], cc_
            If there is client's email present in the "Original To Emails" or "Original CC Emails", always include the client's email in the CC's,
            so they know we are sending the COI to the requested email addresses.
            If you decide not to include the 'From Email' in the 'to_emails_inferred', then for sure include it in the 'cc_emails_inferred', so it's not lost.
+           Always include all the original CC emails in the cc_emails_inferred.  
     
     Respond with ONLY a valid JSON object, with the following keys.
     If the email is not a COI request, leave the values empty strings.
@@ -498,6 +555,98 @@ def get_gmail_credentials(user_email: str):
         sa_info, scopes=GMAIL_SCOPES, subject=user_email
     )
     return creds
+
+
+def send_coi_reply(
+    thread_id: str,
+    to_emails: list[str],
+    cc_emails: list[str],
+    subject_text: str,
+    body_text: str,
+    file_names: list[str],
+    last_message_id: str | None = None,
+    from_email: str = "no-reply@lioninsurance.us",
+):
+    """
+    Sends a reply email in an existing Gmail thread via the specified email address.
+    Attaches provided PDFs. Honors To/CC lists. Actually sends the email (does not create draft).
+    """
+    try:
+        creds = get_gmail_credentials(from_email)
+        service = build("gmail", "v1", credentials=creds)
+
+        msg = EmailMessage()
+        if to_emails:
+            msg["To"] = ", ".join(to_emails)
+        if cc_emails:
+            msg["Cc"] = ", ".join(cc_emails)
+        msg["From"] = f"Lion Insurance Services <{from_email}>"
+        msg["Subject"] = subject_text
+        if last_message_id:
+            msg["In-Reply-To"] = last_message_id
+            msg["References"] = last_message_id
+        msg.set_content(body_text)
+
+        # --- Attach PDFs from GCS ---
+        storage_client = storage.Client()
+        bucket = storage_client.bucket(BUCKET_NAME)
+
+        for file_name in file_names:
+            blob_path = f"certificates/{file_name}"
+            blob = bucket.blob(blob_path)
+
+            # Skip if not found
+            if not blob.exists():
+                print(f"⚠️ File not found in GCS: {blob_path}")
+                continue
+
+            start = time.time()
+            file_bytes = blob.download_as_bytes()
+            type_guess = mimetypes.guess_type(file_name)[0]
+            if type_guess:
+                maintype, subtype = type_guess.split("/", 1)
+            else:
+                maintype, subtype = "application", "octet-stream"
+
+            msg.add_attachment(
+                file_bytes,
+                maintype=maintype,
+                subtype=subtype,
+                filename=file_name,
+            )
+            print(f"Attached {file_name} to email")
+
+        # --- Encode + Send Email ---
+        raw = base64.urlsafe_b64encode(msg.as_bytes()).decode()
+        message_body = {"raw": raw, "threadId": thread_id} if thread_id else {"raw": raw}
+
+        start = time.time()
+        sent_message = (
+            service.users()
+            .messages()
+            .send(userId="me", body=message_body)
+            .execute()
+        )
+        print(f"[TIMING] Gmail messages.send: {time.time() - start:.2f}s")
+
+        message_id = sent_message.get("id")
+        print(f"Gmail API: sent email with ID {message_id} in thread {thread_id} from {from_email}")
+        log_step(
+            "email_sent",
+            thread_id=thread_id,
+            data={
+                "to": to_emails,
+                "cc": cc_emails,
+                "from": from_email,
+                "message_id": message_id,
+                "files": file_names,
+            },
+        )
+        return True
+    except Exception as e:
+        print(f"Unexpected error sending email: {e}")
+        log_step("email_send_failed", status="error", thread_id=thread_id, data={"to": to_emails, "cc": cc_emails, "from": from_email}, error=str(e))
+        return False
 
 
 def create_draft_coi_reply(
@@ -682,19 +831,60 @@ def analyze_for_coi_request(data: dict):
                 final_to_emails = inferred_data.get('to_emails_inferred', [])
                 final_cc_emails = inferred_data.get('cc_emails_inferred', [])
 
-                # Create draft reply email
+                # Check if insured name is in autosend list
+                insured_name = inferred_data.get('insured_name', '').strip()
+                log_step("autosend_check_started", thread_id=thread_id, data={"insured_name": insured_name})
+                
+                # Load autosend companies list
+                autosend_companies = load_autosend_companies()
+                
+                # Normalize insured name for comparison (remove .pdf extension if present)
+                normalized_insured_name = insured_name
+                if normalized_insured_name.lower().endswith(".pdf"):
+                    normalized_insured_name = normalized_insured_name[:-4]
+                normalized_insured_name = normalized_insured_name.strip()
+                
+                # Check if insured name matches any in autosend list (case-insensitive comparison)
+                is_autosend = any(
+                    normalized_insured_name.lower() == autosend_name.lower()
+                    for autosend_name in autosend_companies
+                )
+                
+                log_step("autosend_check_finished", thread_id=thread_id, data={
+                    "insured_name": insured_name,
+                    "normalized_insured_name": normalized_insured_name,
+                    "is_autosend": is_autosend,
+                    "autosend_list_size": len(autosend_companies)
+                })
+
+                # Create email subject and body
                 subject_text = f"Re: {subject}"
                 body_text = "Hello,\nPlease see the COI attached."
                 
-                create_draft_coi_reply(
-                    thread_id=thread_id,
-                    to_emails=final_to_emails,
-                    cc_emails=final_cc_emails,
-                    subject_text=subject_text,
-                    body_text=body_text,
-                    file_names=file_names,
-                    last_message_id=last_message_id,
-                )
+                if is_autosend:
+                    # Send email directly from no-reply@lioninsurance.us
+                    print(f"[INFO] Insured '{insured_name}' is in autosend list - sending email directly from no-reply@lioninsurance.us")
+                    send_coi_reply(
+                        thread_id=thread_id,
+                        to_emails=final_to_emails,
+                        cc_emails=final_cc_emails,
+                        subject_text=subject_text,
+                        body_text=body_text,
+                        file_names=file_names,
+                        last_message_id=last_message_id,
+                        from_email="no-reply@lioninsurance.us",
+                    )
+                else:
+                    # Create draft from tony@lioninsurance.us (existing behavior)
+                    create_draft_coi_reply(
+                        thread_id=thread_id,
+                        to_emails=final_to_emails,
+                        cc_emails=final_cc_emails,
+                        subject_text=subject_text,
+                        body_text=body_text,
+                        file_names=file_names,
+                        last_message_id=last_message_id,
+                    )
                 
                 # Log all COI generation data to Firestore for monitoring
                 try:
