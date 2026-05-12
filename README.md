@@ -1,6 +1,13 @@
-# Lion Insurance Automated COI Handling Bot
+## Lion Insurance Services Automation
 
-## How it works
+This project is about automation efforts for an Insurance Agency.
+
+Currently it supports:
+- Email monitoring for COI requests
+- Automatically preparing and sending renewal documents to the clients
+- Automatically setting up autopays at the beginning of each month
+
+### COI Monitoring: How it works
 
 ```mermaid
 flowchart LR;
