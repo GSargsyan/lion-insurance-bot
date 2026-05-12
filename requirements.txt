@@ -1,0 +1,20 @@
+# --- Shared Dependencies (Used by multiple scripts/services) ---
+google-auth
+google-auth-oauthlib
+google-api-python-client
+google-cloud-firestore
+google-cloud-secret-manager
+google-cloud-storage
+openai
+Flask
+
+# --- Used ONLY by scripts/send_declaration_documents.py ---
+PyPDF2
+
+# --- Used ONLY by services/email_watcher ---
+requests
+
+# --- Used ONLY by coi_generator (local script and cloud service) ---
+PyMuPDF
+fillpdf
+pypdf

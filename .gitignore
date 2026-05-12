@@ -1,2 +1,6 @@
 secrets/*
 services/coi_generator/clients.json
+keys/
+autopays/
+*.log
+venv/
