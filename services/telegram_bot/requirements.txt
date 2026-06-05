@@ -1,7 +1,10 @@
 flask
+gunicorn
 google-cloud-firestore
 google-cloud-secret-manager
+google-cloud-storage
 google-api-python-client
 google-auth
-google-cloud-storage
+google-auth-oauthlib
+openai
 requests
