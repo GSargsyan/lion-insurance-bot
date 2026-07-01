@@ -10,6 +10,7 @@ Flask
 
 # --- Used ONLY by scripts/send_declaration_documents.py ---
 PyPDF2
+pycryptodome
 
 # --- Used ONLY by services/email_watcher ---
 requests

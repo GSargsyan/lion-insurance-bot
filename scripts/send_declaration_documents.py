@@ -35,7 +35,8 @@ SCOPES = [
     "https://www.googleapis.com/auth/drive.readonly",
     "https://www.googleapis.com/auth/gmail.readonly",
     "https://www.googleapis.com/auth/gmail.compose",
-    "https://www.googleapis.com/auth/gmail.labels"
+    "https://www.googleapis.com/auth/gmail.labels",
+    "https://www.googleapis.com/auth/gmail.modify"
 ]
 
 def load_openai_key():
@@ -61,7 +62,7 @@ def get_google_services():
                 creds_data, scopes=["https://www.googleapis.com/auth/drive.readonly"]
             )
             gmail_creds = service_account.Credentials.from_service_account_info(
-                creds_data, scopes=["https://www.googleapis.com/auth/gmail.readonly", "https://www.googleapis.com/auth/gmail.compose", "https://www.googleapis.com/auth/gmail.labels"], subject=SENDER_EMAIL
+                creds_data, scopes=["https://www.googleapis.com/auth/gmail.readonly", "https://www.googleapis.com/auth/gmail.compose", "https://www.googleapis.com/auth/gmail.labels", "https://www.googleapis.com/auth/gmail.modify"], subject=SENDER_EMAIL
             )
         else:
             # Using standard OAuth 2.0 Client credentials
@@ -195,6 +196,11 @@ def search_and_download_binders(openai_client, gmail_service, company_name):
                         
                         try:
                             pdf_reader = PyPDF2.PdfReader(BytesIO(file_data))
+                            if pdf_reader.is_encrypted:
+                                try:
+                                    pdf_reader.decrypt("")
+                                except Exception as decrypt_err:
+                                    logging.warning(f"Could not decrypt PDF {filename}: {decrypt_err}")
                             n_pages = len(pdf_reader.pages)
                             first_page_text = pdf_reader.pages[0].extract_text() if n_pages > 0 else ""
                         except Exception as e:

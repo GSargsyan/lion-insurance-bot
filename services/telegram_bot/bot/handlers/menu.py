@@ -9,13 +9,12 @@ from bot import telegram_helpers
 # Each entry is {"text": "<label>", "callback_data": "<action>"}
 # Group them into rows (inner lists).  One button per row is fine.
 _MENU_BUTTONS: list[list[dict]] = [
-    [{"text": "📋 Create Loss Run Request", "callback_data": "action:loss_run"}],
-    # Future buttons go here, e.g.:
-    # [{"text": "📄 Another Action", "callback_data": "action:another"}],
+    [{"text": "Create Loss Run Request", "callback_data": "action:loss_run"}],
+    [{"text": "Create Endorsement Request", "callback_data": "action:endorsement"}],
 ]
 
 _MENU_TEXT = (
-    "👋 *Welcome to Lion Insurance Bot*\n\n"
+    "*Welcome to Lion Insurance Bot*\n\n"
     "What would you like to do?"
 )
 

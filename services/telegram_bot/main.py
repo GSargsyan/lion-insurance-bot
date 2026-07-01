@@ -33,7 +33,7 @@ import time
 from flask import Flask, request
 
 from bot import gmail_client, openai_client, secrets, telegram_helpers
-from bot.handlers import loss_run, menu
+from bot.handlers import endorsement, loss_run, menu
 
 app = Flask(__name__)
 
@@ -54,6 +54,7 @@ _gmail_sa_info = secrets.get_gmail_service_account_info()
 # Add Telegram user IDs here to grant access. Find yours by messaging @userinfobot.
 _ALLOWED_CHAT_IDS = {
     828259521,  # Grig
+    1199848601,  # Tony
 }
 
 def _is_allowed(chat_id: int | str) -> bool:
@@ -135,10 +136,30 @@ def _handle_callback(cq: dict) -> None:
 
     # ── New action buttons ("action:<name>") ──────────────────────────────────
     if callback_data == "action:menu":
+        loss_run.clear_session(chat_id)
+        endorsement.clear_session(chat_id)
         menu.send_main_menu(chat_id)
 
     elif callback_data == "action:loss_run":
         loss_run.start(chat_id)
+
+    elif callback_data == "action:endorsement":
+        endorsement.start(chat_id)
+
+    elif callback_data.startswith("endorsement:"):
+        parts = callback_data.split(":")
+        if len(parts) >= 3:
+            category, val = parts[1], parts[2]
+            if category == "type":
+                endorsement.handle_type_selection(chat_id, val)
+            elif category == "action":
+                endorsement.handle_action_selection(chat_id, val)
+            else:
+                print(f"[DISPATCH] Unknown endorsement category: {callback_data!r}")
+                menu.send_main_menu(chat_id)
+        else:
+            print(f"[DISPATCH] Invalid endorsement callback_data: {callback_data!r}")
+            menu.send_main_menu(chat_id)
 
     # ── Legacy COI buttons ("coi_send:<thread_id>" / "coi_nosend:<thread_id>") ─
     elif ":" in callback_data:
@@ -165,12 +186,17 @@ def _handle_message(msg: dict) -> None:
 
     # /start command → always show main menu and reset any active session
     if text == "/start":
+        loss_run.clear_session(chat_id)
+        endorsement.clear_session(chat_id)
         menu.send_main_menu(chat_id)
         return
 
     # Delegate to whichever handler is currently active for this chat
     if loss_run.is_awaiting_input(chat_id):
         loss_run.handle_company_name_input(chat_id, text, _gmail_sa_info)
+        return
+    elif endorsement.is_awaiting_input(chat_id):
+        endorsement.handle_message_input(chat_id, text)
         return
 
     # Default: no active session, show main menu
@@ -199,19 +225,6 @@ def telegram_webhook():
     return ("", 204)
 
 
-@app.route("/notify_coi", methods=["POST"])
-def notify_coi():
-    """Legacy endpoint for email_watcher → COI notification flow.
-
-    The email_watcher posts here when it detects a likely COI request email.
-    This keeps backward compatibility without touching the other services.
-    """
-    from bot.handlers import coi_notify  # lazy import — keeps it isolated
-    req_start = time.time()
-    data = request.get_json(silent=True) or {}
-    coi_notify.handle(data)
-    print(f"[TIMING] Total notify_coi handler: {time.time() - req_start:.2f}s")
-    return ("", 204)
 
 
 if __name__ == "__main__":

@@ -8,3 +8,5 @@ google-auth
 google-auth-oauthlib
 openai
 requests
+pdfplumber
+pypdf

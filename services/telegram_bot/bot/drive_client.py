@@ -1,8 +1,9 @@
-"""Google Drive helpers for the telegram bot service.
+"""Google Drive + Docs helpers for the telegram bot service.
 
 Responsibilities:
 - List all file names in a given Drive folder.
 - Download a specific file by its Drive file ID into memory (BytesIO).
+- Read the plain-text content of a Google Doc (for insurer-email lookup).
 """
 import io
 import time
@@ -11,12 +12,15 @@ from google.auth import default
 from googleapiclient.discovery import build
 from googleapiclient.http import MediaIoBaseDownload
 
-_DRIVE_SCOPES = ["https://www.googleapis.com/auth/drive.readonly"]
+_DRIVE_SCOPES = [
+    "https://www.googleapis.com/auth/drive.readonly",
+]
 
 
 def _drive_service():
     creds, _ = default(scopes=_DRIVE_SCOPES)
     return build("drive", "v3", credentials=creds, cache_discovery=False)
+
 
 
 def list_filenames_in_folder(folder_id: str) -> list[str]:
@@ -87,3 +91,39 @@ def download_file_by_name(folder_id: str, filename: str) -> io.BytesIO | None:
 
     fh.seek(0)
     return fh
+
+
+def read_google_doc_text(doc_id: str) -> str:
+    """Return the contents of a Google Sheets file as plain CSV text.
+
+    Uses the Drive API's export endpoint (mimeType=text/csv) which works for
+    Google Sheets and requires only the drive.readonly scope — no separate
+    Sheets or Docs API needs to be enabled.
+
+    Args:
+        doc_id: The Google Sheets file ID.
+
+    Returns:
+        CSV text of the first sheet, or "" on failure.
+    """
+    start = time.time()
+    try:
+        service = _drive_service()
+        response = (
+            service.files()
+            .export(fileId=doc_id, mimeType="text/csv")
+            .execute()
+        )
+    except Exception as exc:
+        print(f"[DRIVE] Failed to export Google Sheet {doc_id!r} as CSV: {exc}")
+        return ""
+
+    # response is raw bytes
+    if isinstance(response, bytes):
+        result = response.decode("utf-8", errors="replace")
+    else:
+        result = str(response)
+
+    print(f"[TIMING] Drive Sheet export: {time.time() - start:.2f}s")
+    print(f"[DRIVE] Google Sheet {doc_id!r}: {len(result)} chars exported")
+    return result
