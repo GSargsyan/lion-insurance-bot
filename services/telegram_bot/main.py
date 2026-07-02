@@ -6,12 +6,14 @@ main.py                 Flask app + Telegram webhook handler (this file)
 bot/secrets.py          Secret Manager fetching
 bot/telegram_helpers.py Telegram HTTP wrappers
 bot/drive_client.py     Google Drive file listing & download
-bot/openai_client.py    LLM company-name fuzzy matching
-bot/gmail_client.py     Gmail draft creation
+bot/openai_client.py    LLM helpers (matching, phone extraction, renewal clients)
+bot/gmail_client.py     Gmail draft creation + autopay email helpers
+bot/pdf_parser.py       PDF form field extractor + Notices PDF parser
+bot/pdf_filler.py       PyMuPDF coordinate-based PDF form filler
 bot/handlers/
-    menu.py             Main menu builder
+    menu.py             Main menu builder (2 buttons)
     loss_run.py         Loss Run Request conversation handler
-    coi_notify.py       Legacy COI notification handler (email_watcher integration)
+    autopay.py          Autopay Extraction handler (background thread)
 
 Dispatching logic
 ─────────────────
@@ -20,8 +22,10 @@ POST /          Telegram webhook payload
   ├─ callback_query             → route by callback_data prefix
   │     "action:menu"           → show main menu
   │     "action:loss_run"       → loss_run.start()
+  │     "action:autopay"        → autopay.start()
   └─ message.text (any)         → check active session and delegate
         loss_run awaiting       → loss_run.handle_company_name_input()
+        autopay awaiting        → autopay.handle_company_name_input()
         (no active session)     → show main menu
 
 POST /notify_coi    Legacy endpoint — kept for backward compatibility with
@@ -33,7 +37,7 @@ import time
 from flask import Flask, request
 
 from bot import gmail_client, openai_client, secrets, telegram_helpers
-from bot.handlers import endorsement, loss_run, menu
+from bot.handlers import autopay, loss_run, menu
 
 app = Flask(__name__)
 
@@ -137,29 +141,14 @@ def _handle_callback(cq: dict) -> None:
     # ── New action buttons ("action:<name>") ──────────────────────────────────
     if callback_data == "action:menu":
         loss_run.clear_session(chat_id)
-        endorsement.clear_session(chat_id)
+        autopay.clear_session(chat_id)
         menu.send_main_menu(chat_id)
 
     elif callback_data == "action:loss_run":
         loss_run.start(chat_id)
 
-    elif callback_data == "action:endorsement":
-        endorsement.start(chat_id)
-
-    elif callback_data.startswith("endorsement:"):
-        parts = callback_data.split(":")
-        if len(parts) >= 3:
-            category, val = parts[1], parts[2]
-            if category == "type":
-                endorsement.handle_type_selection(chat_id, val)
-            elif category == "action":
-                endorsement.handle_action_selection(chat_id, val)
-            else:
-                print(f"[DISPATCH] Unknown endorsement category: {callback_data!r}")
-                menu.send_main_menu(chat_id)
-        else:
-            print(f"[DISPATCH] Invalid endorsement callback_data: {callback_data!r}")
-            menu.send_main_menu(chat_id)
+    elif callback_data == "action:autopay":
+        autopay.start(chat_id)
 
     # ── Legacy COI buttons ("coi_send:<thread_id>" / "coi_nosend:<thread_id>") ─
     elif ":" in callback_data:
@@ -187,7 +176,7 @@ def _handle_message(msg: dict) -> None:
     # /start command → always show main menu and reset any active session
     if text == "/start":
         loss_run.clear_session(chat_id)
-        endorsement.clear_session(chat_id)
+        autopay.clear_session(chat_id)
         menu.send_main_menu(chat_id)
         return
 
@@ -195,8 +184,9 @@ def _handle_message(msg: dict) -> None:
     if loss_run.is_awaiting_input(chat_id):
         loss_run.handle_company_name_input(chat_id, text, _gmail_sa_info)
         return
-    elif endorsement.is_awaiting_input(chat_id):
-        endorsement.handle_message_input(chat_id, text)
+
+    if autopay.is_awaiting_input(chat_id):
+        autopay.handle_company_name_input(chat_id, text, _gmail_sa_info)
         return
 
     # Default: no active session, show main menu

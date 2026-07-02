@@ -217,3 +217,173 @@ Do NOT include the insured name in the policy_numbers list.
     print(f"[OpenAI] Resolved {len(result)} draft spec(s): "
           + str([{d['insurer_name']: d['policy_numbers']} for d in result]))
     return result
+
+
+# ── Autopay helpers ───────────────────────────────────────────────────────────
+
+RENEWALS_DOC_ID = "1qPO_OurfEGjEE3OZxV3iFZqADM2oeQrHif_XWmS56YQ"
+
+
+def normalize_company_name(user_input: str) -> str | None:
+    """Normalize a free-form company name input to a clean canonical form.
+
+    Uses gpt-4o-mini to capitalize and clean the name (e.g. "kim transportation llc"
+    → "KIM TRANSPORTATION LLC"). Returns None if the input is too vague or unusable.
+
+    Args:
+        user_input: Raw text typed by the user.
+
+    Returns:
+        Normalized company name string, or None if input is unusable.
+    """
+    prompt = f"""\
+You are given a user's free-text input that should be a company name.
+Normalize it to a clean, properly capitalized canonical form (e.g. "KIM TRANSPORTATION LLC").
+Return ONLY valid JSON: {{"name": "<normalized name>"}} or {{"name": null}} if the input is
+too short, nonsensical, or clearly not a company name.
+
+User input: {user_input}
+"""
+    start = time.time()
+    try:
+        response = (
+            _get_client()
+            .chat.completions.create(
+                model="gpt-4o-mini",
+                response_format={"type": "json_object"},
+                messages=[
+                    {
+                        "role": "system",
+                        "content": (
+                            "You normalize company names for a commercial trucking "
+                            "insurance agency."
+                        ),
+                    },
+                    {"role": "user", "content": prompt},
+                ],
+            )
+            .choices[0]
+            .message.content
+        )
+        print(f"[TIMING] OpenAI normalize_company_name: {time.time() - start:.2f}s")
+        result = json.loads(response)
+        name = result.get("name")
+        print(f"[LLM:normalize_company_name] {user_input!r} → {name!r}")
+        return name or None
+    except Exception as exc:
+        print(f"[OpenAI] normalize_company_name failed: {exc}")
+        return None
+
+
+def extract_phone_number(pdf_text: str) -> str | None:
+
+    """Extract and format a client phone number from PDF page text.
+
+    Calls gpt-4o-mini. Returns the number formatted as (xxx) xxx-xxxx,
+    or None if not found.
+
+    Args:
+        pdf_text: Plain text extracted from the first page of a quick-quote form.
+
+    Returns:
+        Formatted phone string or None.
+    """
+    prompt = f"""\
+Extract the CLIENT's phone number from the document text below.
+If found, format it exactly as (xxx) xxx-xxxx.
+Return only valid JSON: {{"phone": "(xxx) xxx-xxxx"}} or {{"phone": null}} if not found.
+
+Document text:
+{pdf_text[:4000]}
+"""
+    start = time.time()
+    try:
+        response = (
+            _get_client()
+            .chat.completions.create(
+                model="gpt-4o-mini",
+                response_format={"type": "json_object"},
+                messages=[
+                    {
+                        "role": "system",
+                        "content": "You extract phone numbers from insurance documents.",
+                    },
+                    {"role": "user", "content": prompt},
+                ],
+            )
+            .choices[0]
+            .message.content
+        )
+        print(f"[TIMING] OpenAI extract_phone_number: {time.time() - start:.2f}s")
+        result = json.loads(response)
+        return result.get("phone") or None
+    except Exception as exc:
+        print(f"[OpenAI] extract_phone_number failed: {exc}")
+        return None
+
+
+def get_renewal_clients(month: str, year: str) -> list[str]:
+    """Return clients scheduled for renewal in *month* *year*.
+
+    Reads the Lion Insurance Renewals Google Doc (plain-text export) and asks
+    gpt-4o-mini to extract company names for the requested month.
+
+    Args:
+        month: Month name, e.g. "June".
+        year:  Four-digit year string, e.g. "2026".
+
+    Returns:
+        List of company name strings (possibly empty).
+    """
+    from bot import drive_client  # local import to avoid circular dependency
+
+    doc_content = drive_client.read_google_doc_plain_text(RENEWALS_DOC_ID)
+    if not doc_content:
+        print("[OpenAI] get_renewal_clients: empty doc content")
+        return []
+
+    # The renewals doc is chronological (oldest months at top, newest at bottom).
+    # Take the LAST 8000 chars so we always capture the most recent entries.
+    MAX_CHARS = 8000
+    if len(doc_content) > MAX_CHARS:
+        print(f"[OpenAI] get_renewal_clients: truncating doc from {len(doc_content)} to last {MAX_CHARS} chars")
+        doc_content = doc_content[-MAX_CHARS:]
+
+    prompt = f"""\
+You are given the text content of a Google Document named "Lion Insurance Renewals".
+Extract the list of client/company names that are scheduled for renewal in {month} {year}.
+Return a JSON object with a single key `clients` containing a list of strings.
+Return only the company names (capitalized), not dates or other text.
+If none found, return {{"clients": []}}.
+
+Document:
+{doc_content}
+"""
+    start = time.time()
+    try:
+        response = (
+            _get_client()
+            .chat.completions.create(
+                model="gpt-4o-mini",
+                response_format={"type": "json_object"},
+                timeout=60,
+                messages=[
+                    {
+                        "role": "system",
+                        "content": "You carefully extract structured information from insurance renewal documents.",
+                    },
+                    {"role": "user", "content": prompt},
+                ],
+            )
+            .choices[0]
+            .message.content
+        )
+        print(f"[TIMING] OpenAI get_renewal_clients: {time.time() - start:.2f}s")
+        data = json.loads(response)
+        clients = data.get("clients", [])
+        print(f"[OpenAI] get_renewal_clients for {month} {year}: {clients}")
+        return clients
+    except Exception as exc:
+        print(f"[OpenAI] get_renewal_clients failed: {exc}")
+        return []
+

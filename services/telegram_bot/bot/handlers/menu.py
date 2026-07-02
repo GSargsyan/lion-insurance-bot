@@ -10,7 +10,7 @@ from bot import telegram_helpers
 # Group them into rows (inner lists).  One button per row is fine.
 _MENU_BUTTONS: list[list[dict]] = [
     [{"text": "Create Loss Run Request", "callback_data": "action:loss_run"}],
-    [{"text": "Create Endorsement Request", "callback_data": "action:endorsement"}],
+    [{"text": "Extract Autopay Form", "callback_data": "action:autopay"}],
 ]
 
 _MENU_TEXT = (
@@ -22,3 +22,4 @@ _MENU_TEXT = (
 def send_main_menu(chat_id: int | str) -> None:
     """Send (or re-send) the main menu to the given chat."""
     telegram_helpers.send_message(chat_id, _MENU_TEXT, buttons=_MENU_BUTTONS)
+

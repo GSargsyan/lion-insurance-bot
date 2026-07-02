@@ -134,7 +134,7 @@ def handle_company_name_input(
     if not matched_name:
         telegram_helpers.send_message(
             chat_id,
-            "🤷 Could not find a matching company for *{}*.\n\n"
+            "Could not find a matching company for *{}*.\n\n"
             "Please try again with a different name, or return to the main menu.".format(
                 user_text
             ),

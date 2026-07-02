@@ -127,3 +127,39 @@ def read_google_doc_text(doc_id: str) -> str:
     print(f"[TIMING] Drive Sheet export: {time.time() - start:.2f}s")
     print(f"[DRIVE] Google Sheet {doc_id!r}: {len(result)} chars exported")
     return result
+
+
+def read_google_doc_plain_text(doc_id: str) -> str:
+    """Return the contents of a Google Doc as plain text.
+
+    Uses the Drive API's export endpoint (mimeType=text/plain) which works for
+    Google Docs. Use this for documents (as opposed to Sheets, which use
+    read_google_doc_text with CSV export).
+
+    Args:
+        doc_id: The Google Doc file ID.
+
+    Returns:
+        Plain text content of the document, or "" on failure.
+    """
+    start = time.time()
+    try:
+        service = _drive_service()
+        response = (
+            service.files()
+            .export(fileId=doc_id, mimeType="text/plain")
+            .execute()
+        )
+    except Exception as exc:
+        print(f"[DRIVE] Failed to export Google Doc {doc_id!r} as plain text: {exc}")
+        return ""
+
+    if isinstance(response, bytes):
+        result = response.decode("utf-8", errors="replace")
+    else:
+        result = str(response)
+
+    print(f"[TIMING] Drive Doc plain-text export: {time.time() - start:.2f}s")
+    print(f"[DRIVE] Google Doc {doc_id!r}: {len(result)} chars exported")
+    return result
+
