@@ -271,7 +271,9 @@ def search_and_download_binders(openai_client, gmail_service, company_name):
         return {}
 
 def get_driver_names(openai_client, drive_service, company_name):
-    query = f"'{DRIVERS_FOLDER_ID}' in parents and name contains '{company_name}' and trashed = false"
+    # Escape single quotes for Google Drive query syntax
+    escaped_company = company_name.replace("'", "\\'")
+    query = f"'{DRIVERS_FOLDER_ID}' in parents and name contains '{escaped_company}' and trashed = false"
     response = drive_service.files().list(q=query, fields="files(id, name, mimeType)").execute()
     files = response.get('files', [])
     
