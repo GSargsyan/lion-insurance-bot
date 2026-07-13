@@ -322,7 +322,124 @@ Document text:
         return None
 
 
+def extract_notices_loan_info(page_text_snippet: str) -> dict | None:
+    """Extract loan number and insured info from a FIRST Insurance Funding Notices PDF page.
+
+    Uses gpt-4o-mini to parse the structured block that appears near the end of
+    each Notice of Acceptance page.  Handles the optional DBA (Doing Business As)
+    line that some insured companies have between their legal name and their street
+    address.
+
+    The expected block in the PDF looks like::
+
+        Loan Number
+        XXX - 106980543
+        ...
+        Insured
+        KIM TRANSPORTATION LLC      ← company_name
+        (optional DBA line)         ← dba  (if present)
+        24951 ARBOR CREST CIR       ← address_line1
+        HAYWARD, CA 94544-1233      ← address_line2
+
+    Args:
+        page_text_snippet: The tail portion of a single Notices PDF page (from the
+            "Loan Number" keyword onward, ~600–700 characters is typically enough).
+
+    Returns:
+        Dict with keys:
+            loan_number   – e.g. "106980543"  (numeric part only, no "XXX - " prefix)
+            company_name  – legal name of the insured
+            dba           – DBA name if found, otherwise None / absent
+            address_line1 – street address line
+            address_line2 – city/state/zip line
+        Returns None on failure.
+    """
+    prompt = f"""\
+You are reading a text snippet extracted from a FIRST Insurance Funding "Notice of Acceptance" PDF.
+
+The snippet contains a structured block that looks like this:
+
+    Loan Number
+    XXX - <DIGITS>
+    ... (some boilerplate lines) ...
+    Insured
+    <COMPANY NAME>
+    [<OPTIONAL DBA LINE>]
+    <STREET ADDRESS>
+    <CITY, STATE ZIP>
+
+Your task:
+1. Extract the loan number: the digits that appear after "XXX -" near "Loan Number".
+2. Extract the insured company's legal name (the line immediately after "Insured").
+3. Check whether the next line is a DBA (Doing Business As) alias rather than a street address.
+   - A street address starts with digits (e.g. "24951 ARBOR CREST CIR") or common address
+     words (e.g. "PO BOX", "SUITE", "APT").
+   - A DBA line is a business name with no leading digits (e.g. "A ONE TRANSPORT",
+     "BLUE SKY LOGISTICS INC").
+   - If you judge the line to be a DBA, put it in the "dba" field; otherwise leave "dba" as null.
+4. Extract the two-line address:
+   - address_line1: the street / PO Box line
+   - address_line2: the city, state, and ZIP line (e.g. "HAYWARD, CA 94544-1233")
+
+Return ONLY valid JSON with exactly these keys:
+{{
+  "loan_number":   "<digits only>",
+  "company_name":  "<legal name>",
+  "dba":           "<dba name or null>",
+  "address_line1": "<street line>",
+  "address_line2": "<city, state zip>"
+}}
+
+Text snippet:
+{page_text_snippet}
+"""
+    start = time.time()
+    try:
+        response = (
+            _get_client()
+            .chat.completions.create(
+                model="gpt-4o-mini",
+                response_format={"type": "json_object"},
+                messages=[
+                    {
+                        "role": "system",
+                        "content": (
+                            "You extract structured data from insurance funding "
+                            "notice documents. Always respond with valid JSON."
+                        ),
+                    },
+                    {"role": "user", "content": prompt},
+                ],
+            )
+            .choices[0]
+            .message.content
+        )
+        print(f"[TIMING] OpenAI extract_notices_loan_info: {time.time() - start:.2f}s")
+        result = json.loads(response)
+        print(f"[LLM:extract_notices_loan_info] raw result: {result}")
+        # Normalise: ensure required keys exist
+        loan_number = (result.get("loan_number") or "").strip()
+        company_name = (result.get("company_name") or "").strip()
+        dba = (result.get("dba") or "").strip() or None
+        address_line1 = (result.get("address_line1") or "").strip()
+        address_line2 = (result.get("address_line2") or "").strip()
+        if not loan_number or not company_name:
+            print("[LLM:extract_notices_loan_info] Missing required fields in LLM response.")
+            return None
+        return {
+            "loan_number": loan_number,
+            "company_name": company_name,
+            "dba": dba,
+            "address_line1": address_line1,
+            "address_line2": address_line2,
+        }
+    except Exception as exc:
+        print(f"[OpenAI] extract_notices_loan_info failed: {exc}")
+        return None
+
+
 def get_renewal_clients(month: str, year: str) -> list[str]:
+
     """Return clients scheduled for renewal in *month* *year*.
 
     Reads the Lion Insurance Renewals Google Doc (plain-text export) and asks

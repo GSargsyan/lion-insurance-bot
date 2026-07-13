@@ -364,7 +364,7 @@ def fetch_notices_pdfs(company_name: str, sa_info: dict) -> list[bytes]:
     """
     service = _read_gmail_service(sa_info)
     query = (
-        f'subject:"FIRST Insurance Funding - Notice of Acceptance" '
+        f'subject:"Notice of Acceptance" '
         f'{company_name} has:attachment newer_than:60d'
     )
 

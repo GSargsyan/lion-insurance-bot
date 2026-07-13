@@ -8,7 +8,7 @@ Conversation flow:
   4. Pipeline steps:
        a. Fetch ACH forms + extract client email from signing notification email.
        b. Fetch FIRST Insurance Funding Notices PDFs.
-       c. Parse loan numbers + address from Notices (pure regex, no LLM).
+       c. Parse loan numbers, address, and optional DBA from Notices via gpt-4o-mini.
        d. Fetch quick-quote form and extract phone number via LLM.
        e. Fill each ACH form × each loan entry with PyMuPDF.
        f. Send filled PDF(s) by email to tony@lioninsurance.us.
@@ -68,7 +68,7 @@ def start(chat_id: int | str) -> None:
     telegram_helpers.send_message(
         chat_id,
         "🏦 *Autopay Extraction*\n\n"
-        "Please type the insured company name (e.g. _kim transportation_):",
+        "Please type the insured company name:",
         buttons=[[{"text": "🏠 Main Menu", "callback_data": "action:menu"}]],
     )
 
@@ -165,27 +165,9 @@ def _run_extraction(
         loan_numbers_found = 0
         filled_files: list[tuple[str, bytes]] = []
 
-        # ── Step 1: Fetch ACH Debit Authorization forms + client email ─────────
-        ach_forms: list[tuple[str, bytes]] = []
-        client_email = ""
-        try:
-            ach_forms, client_email = gmail_client.fetch_ach_forms(client, sa_info)
-            print(
-                f"[AUTOPAY] ACH forms: {len(ach_forms)}, "
-                f"client_email={client_email!r}"
-            )
-        except Exception as exc:
-            print(f"[AUTOPAY] fetch_ach_forms failed: {exc}")
-
-        # If email wasn't in the ACH signing email, try fetching it separately
-        if not client_email:
-            try:
-                client_email = gmail_client.fetch_client_email(client, sa_info)
-                print(f"[AUTOPAY] client_email (fallback search): {client_email!r}")
-            except Exception as exc:
-                print(f"[AUTOPAY] fetch_client_email failed: {exc}")
-
-        # ── Step 2: Fetch FIRST Insurance Funding Notices PDFs ─────────────────
+        # ── Step 1: Fetch FIRST Insurance Funding Notices PDFs + parse loans ───
+        # Loan numbers are the most likely to be missing — check first to avoid
+        # wasting further calls (including LLM tokens) if none are found.
         notices_bytes_list: list[bytes] = []
         try:
             notices_bytes_list = gmail_client.fetch_notices_pdfs(client, sa_info)
@@ -193,7 +175,6 @@ def _run_extraction(
         except Exception as exc:
             print(f"[AUTOPAY] fetch_notices_pdfs failed: {exc}")
 
-        # ── Step 3: Parse loan numbers + address from Notices ──────────────────
         loan_entries: list[dict] = []
         for notices_bytes in notices_bytes_list:
             try:
@@ -205,7 +186,53 @@ def _run_extraction(
         loan_numbers_found = len(loan_entries)
         print(f"[AUTOPAY] Loan entries for {client!r}: {loan_entries}")
 
-        # ── Step 4: Fetch quick-quote form and extract phone number ────────────
+        if not loan_entries:
+            elapsed = time.time() - pipeline_start
+            telegram_helpers.send_message(
+                chat_id,
+                f"⚠️ *Autopay extraction done* ({elapsed:.0f}s)\n\n"
+                f"Client: *{client}*\n"
+                f"No loan numbers found — nothing to fill.",
+            )
+            menu.send_main_menu(chat_id)
+            return
+
+        # ── Step 2: Fetch ACH Debit Authorization forms ────────────────────────
+        # Only fetched once we know there are loan numbers to fill.
+        ach_forms: list[tuple[str, bytes]] = []
+        client_email = ""
+        try:
+            ach_forms, client_email = gmail_client.fetch_ach_forms(client, sa_info)
+            print(
+                f"[AUTOPAY] ACH forms: {len(ach_forms)}, "
+                f"client_email={client_email!r}"
+            )
+        except Exception as exc:
+            print(f"[AUTOPAY] fetch_ach_forms failed: {exc}")
+
+        if not ach_forms:
+            elapsed = time.time() - pipeline_start
+            telegram_helpers.send_message(
+                chat_id,
+                f"⚠️ *Autopay extraction done* ({elapsed:.0f}s)\n\n"
+                f"Client: *{client}*\n"
+                f"Loan numbers found: {loan_numbers_found}\n"
+                f"No ACH forms found — nothing to fill.",
+            )
+            menu.send_main_menu(chat_id)
+            return
+
+        # ── Step 3: Fetch client email (fallback) + phone number ──────────────
+        # Only reached when we have both loan entries and ACH forms.
+
+        # If email wasn't in the ACH signing email, try fetching it separately
+        if not client_email:
+            try:
+                client_email = gmail_client.fetch_client_email(client, sa_info)
+                print(f"[AUTOPAY] client_email (fallback search): {client_email!r}")
+            except Exception as exc:
+                print(f"[AUTOPAY] fetch_client_email failed: {exc}")
+
         phone = ""
         try:
             qq_bytes = gmail_client.fetch_quickquote_first_page(client, sa_info)
@@ -219,13 +246,17 @@ def _run_extraction(
         except Exception as exc:
             print(f"[AUTOPAY] Phone extraction failed: {exc}")
 
-        # ── Step 5: Fill ACH form × loan entry combinations ───────────────────
+        # ── Step 4: Fill ACH form × loan entry combinations ───────────────────
         if ach_forms and loan_entries:
             for ach_filename, ach_bytes in ach_forms:
                 for entry in loan_entries:
-                    loan_num = entry["loan_number"]
-                    company = entry.get("company_name") or client
+                    loan_num = f"Loan Number: {entry['loan_number']}"
+                    base_name = entry.get("company_name") or client
+                    dba = entry.get("dba")
+                    # Append DBA to company name if present
+                    company = f"{base_name}, DBA: {dba}" if dba else base_name
                     address = entry.get("address") or ""
+
                     try:
                         filled_bytes = pdf_filler.fill_ach_form(
                             pdf_bytes=ach_bytes,
@@ -236,7 +267,7 @@ def _run_extraction(
                             email=client_email,
                         )
                         base = ach_filename.rsplit(".", 1)[0]
-                        out_name = f"FILLED_{base}_{loan_num}.pdf"
+                        out_name = f"{base}_{loan_num}.pdf"
                         filled_files.append((out_name, filled_bytes))
                         print(f"[AUTOPAY] Filled: {out_name}")
                     except Exception as exc:
@@ -250,7 +281,7 @@ def _run_extraction(
                 f"ach_forms={len(ach_forms)}, loan_entries={len(loan_entries)}"
             )
 
-        # ── Step 6: Send email with all filled PDFs ────────────────────────────
+        # ── Step 5: Send email with all filled PDFs ────────────────────────────
         if filled_files:
             try:
                 gmail_client.send_autopay_email(filled_files, client, sa_info)

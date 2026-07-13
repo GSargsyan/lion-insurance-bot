@@ -1,6 +1,5 @@
 """COI PDF form field extractor + Notices PDF parser for the telegram bot service."""
 import io
-import re
 import time
 from io import BytesIO
 from pypdf import PdfReader
@@ -65,7 +64,11 @@ def extract_acord_fields(pdf_bytes: io.BytesIO) -> dict:
 def parse_notices_pdf(pdf_bytes: bytes, expected_company: str) -> list[dict]:
     """Parse a FIRST Insurance Funding Notice of Acceptance PDF.
 
-    Extracts loan number, company name, and address for each loan found.
+    Extracts loan number, company name, optional DBA, and address for each
+    loan found using an LLM call (gpt-4o-mini).  Only the tail portion of
+    each page's text (from the "Loan Number" keyword onward, ≤ 800 chars) is
+    sent to the LLM to keep token usage minimal.
+
     Only returns entries whose company name matches *expected_company* —
     this prevents accidental loan-number mix-ups when a single PDF covers
     multiple clients.
@@ -76,9 +79,14 @@ def parse_notices_pdf(pdf_bytes: bytes, expected_company: str) -> list[dict]:
                            (used for safety cross-check).
 
     Returns:
-        List of dicts: [{loan_number, company_name, address}, ...]
+        List of dicts: [{loan_number, company_name, dba, address}, ...]
+        - ``dba`` is a string if the insured has a "Doing Business As" name,
+          otherwise None.
+        - ``address`` is "<address_line1>, <address_line2>".
         Empty list if nothing matches or parsing fails.
     """
+    from bot import openai_client  # local import to avoid circular dependency at module load
+
     results: list[dict] = []
     try:
         reader = PdfReader(BytesIO(pdf_bytes))
@@ -93,29 +101,24 @@ def parse_notices_pdf(pdf_bytes: bytes, expected_company: str) -> list[dict]:
         if "Loan Number" not in text:
             continue
 
-        # ── Loan number ───────────────────────────────────────────────────────
-        # Actual PDF text: "Loan Number\nXXX - 106980543\nRefer to this..."
-        # The "XXX" is a literal fixed prefix on all FIRST Insurance Funding loans.
-        # We capture only the numeric part after "XXX - ".
-        loan_match = re.search(r"Loan Number\s+XXX\s*-\s*(\d+)", text)
-        if not loan_match:
+        # ── Extract a compact snippet starting from "Loan Number" ─────────────
+        # The loan number + insured block always appears in the tail of the page.
+        # Sending only this portion keeps the LLM prompt small (saves tokens).
+        ln_idx = text.find("Loan Number")
+        snippet = text[ln_idx : ln_idx + 800]  # ~600-700 chars is usually enough
+
+        # ── LLM extraction ────────────────────────────────────────────────────
+        info = openai_client.extract_notices_loan_info(snippet)
+        if not info:
+            print(f"[PDF_PARSER] Page {page_num + 1}: LLM extraction returned nothing. Skipping.")
             continue
-        loan_number = loan_match.group(1).strip()  # e.g. "106980543"
 
-
-        # ── Insured block ─────────────────────────────────────────────────────
-        # Pattern: "Insured\r\nCOMPANY NAME\r\nSTREET ADDRESS\r\nCITY, STATE ZIP"
-        insured_match = re.search(
-            r"Insured\r?\n(.+)\r?\n(.+)\r?\n([\w\s]+,\s+[A-Z]{2}\s+\d{5}[^\r\n]*)",
-            text,
-        )
-        company_name: str | None = None
-        address: str | None = None
-        if insured_match:
-            company_name = insured_match.group(1).strip()
-            addr_line1 = insured_match.group(2).strip()
-            addr_line2 = insured_match.group(3).strip()
-            address = f"{addr_line1}, {addr_line2}"
+        loan_number = info["loan_number"]
+        company_name = info["company_name"]
+        dba = info.get("dba")  # may be None
+        address_line1 = info.get("address_line1", "")
+        address_line2 = info.get("address_line2", "")
+        address = f"{address_line1}, {address_line2}".strip(", ") if address_line1 or address_line2 else ""
 
         # ── Company name safety check ─────────────────────────────────────────
         if company_name:
@@ -133,14 +136,14 @@ def parse_notices_pdf(pdf_bytes: bytes, expected_company: str) -> list[dict]:
             {
                 "loan_number": loan_number,
                 "company_name": company_name,
+                "dba": dba,
                 "address": address,
             }
         )
         print(
             f"[PDF_PARSER] Page {page_num + 1}: loan {loan_number} "
-            f"matched {company_name!r}, address={address!r}"
+            f"matched {company_name!r}, dba={dba!r}, address={address!r}"
         )
 
     return results
-
 
