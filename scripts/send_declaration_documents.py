@@ -145,7 +145,8 @@ def get_clients_for_month(openai_client, drive_service, month, year):
     You are given the text content of a Google Document named "Lion Insurance Renewals".
     Extract the list of client/company names that are scheduled for renewal in {month} {year}.
     Return the result as a JSON object with a single key `clients` containing a list of strings.
-    Only the capitalized names of clients are needed, not dates or anything else that is written.
+    Extract all client/company names listed for that month regardless of whether they are written in ALL CAPS or mixed case.
+    Do NOT include policy numbers, coverages (e.g. AL, APD, MTC), dates, or notes (e.g. 'cancelled').
     If none are found, return an empty list.
 
     Document Content:
