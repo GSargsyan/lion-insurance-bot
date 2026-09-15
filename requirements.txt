@@ -12,6 +12,9 @@ Flask
 PyPDF2
 pycryptodome
 
+# --- Used ONLY by scripts/gaig_portal_download_poc.py (also needs: playwright install chromium) ---
+playwright
+
 # --- Used ONLY by services/email_watcher ---
 requests
 
