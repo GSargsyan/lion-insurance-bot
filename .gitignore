@@ -2,6 +2,7 @@ secrets/*
 services/coi_generator/clients.json
 keys/
 autopays/
+downloads/
 *.log
 venv/
 __pycache__/

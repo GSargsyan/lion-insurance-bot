@@ -26,7 +26,8 @@ GAIG_CREDS_PATH = os.path.join(KEYS_DIR, "gaig_credentials.json")
 
 LOGIN_URL = "https://login-registration.gaig.com/agent"
 COMPANY_NAME = "REDDLINE TRANSPORTATION LLC"
-OUT_PATH = os.path.join(os.path.dirname(__file__), "..", "reddline_dec_doc.pdf")
+DOWNLOADS_DIR = os.path.join(os.path.dirname(__file__), "..", "downloads")
+OUT_PATH = os.path.join(DOWNLOADS_DIR, "reddline_dec_doc.pdf")
 
 
 def load_gaig_credentials():
@@ -118,6 +119,7 @@ def main():
         with page.expect_download() as download_info:
             doc_row.get_by_role("button", name=re.compile("Download", re.I)).click()
         download = download_info.value
+        os.makedirs(DOWNLOADS_DIR, exist_ok=True)
         download.save_as(OUT_PATH)
 
         print(f"Saved to {OUT_PATH}")
