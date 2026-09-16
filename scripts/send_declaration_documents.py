@@ -2,6 +2,8 @@ import os
 import json
 import base64
 import re
+import time
+import logging
 from datetime import datetime
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
@@ -14,13 +16,16 @@ from google.oauth2.credentials import Credentials
 from google_auth_oauthlib.flow import InstalledAppFlow
 from google.auth.transport.requests import Request
 from googleapiclient.discovery import build
+from googleapiclient.http import MediaIoBaseDownload
 from openai import OpenAI
 import PyPDF2
-import logging
+from pypdf import PdfReader
+from playwright.sync_api import sync_playwright
 
 # --- Configuration ---
 KEYS_DIR = os.path.join(os.path.dirname(__file__), "..", "keys")
 LOG_FILE = os.path.join(os.path.dirname(__file__), "..", "declarations.log")
+DOWNLOADS_DIR = os.path.join(os.path.dirname(__file__), "..", "downloads")
 
 logging.basicConfig(
     filename=LOG_FILE,
@@ -29,7 +34,21 @@ logging.basicConfig(
 )
 RENEWALS_DOC_ID = "1qPO_OurfEGjEE3OZxV3iFZqADM2oeQrHif_XWmS56YQ"
 DRIVERS_FOLDER_ID = "1NLt-FqU-wvr8VU3fDbiRSK2dcz8DakPl"
+DRIVE_CERTS_FOLDER_ID = "1KIeq3LHWWklQBanmADUz6XVYodlF2id6"
 SENDER_EMAIL = "tony@lioninsurance.us"
+
+GAIG_CREDS_PATH = os.path.join(KEYS_DIR, "gaig_credentials.json")
+PARAMOUNT_CREDS_PATH = os.path.join(KEYS_DIR, "paramount_credentials.json")
+TRINITY_CREDS_PATH = os.path.join(KEYS_DIR, "trinity_credentials.json")
+
+# Physical Damage is never a proper AcroForm field on this agency's ACORD 25s --
+# it's always the first line of the free-text remarks block, e.g.
+# "A    PHYSICAL DAMAGE    <policy#>    <eff> - <exp>". Mirrors the same regex
+# used by the Django AMS (lion.clients.services.PD_REMARKS_RE).
+PD_REMARKS_RE = re.compile(
+    r'([A-F])\s+PHYSICAL DAMAGE\s+(.+?)\s+(\d{2}/\d{2}/\d{4})\s*-\s*(\d{2}/\d{2}/\d{4})',
+    re.IGNORECASE,
+)
 
 SCOPES = [
     "https://www.googleapis.com/auth/drive.readonly",
@@ -54,7 +73,7 @@ def get_google_services():
     if os.path.exists(creds_path):
         with open(creds_path, 'r') as f:
             creds_data = json.load(f)
-        
+
         if "type" in creds_data and creds_data["type"] == "service_account":
             # Using Service Account with domain-wide delegation
             print("Using Service Account credentials...")
@@ -71,17 +90,17 @@ def get_google_services():
             creds = None
             if os.path.exists(token_path):
                 creds = Credentials.from_authorized_user_file(token_path, SCOPES)
-            
+
             if not creds or not creds.valid:
                 if creds and creds.expired and creds.refresh_token:
                     creds.refresh(Request())
                 else:
                     flow = InstalledAppFlow.from_client_secrets_file(creds_path, SCOPES)
                     creds = flow.run_local_server(port=0)
-                
+
                 with open(token_path, "w") as token:
                     token.write(creds.to_json())
-            
+
             drive_creds = creds
             gmail_creds = creds
     else:
@@ -90,7 +109,7 @@ def get_google_services():
 
     drive_service = build("drive", "v3", credentials=drive_creds)
     gmail_service = build("gmail", "v1", credentials=gmail_creds)
-    
+
     return drive_service, gmail_service
 
 def extract_text(payload):
@@ -152,7 +171,7 @@ def get_clients_for_month(openai_client, drive_service, month, year):
     Document Content:
     {doc_content}
     """
-    
+
     response = openai_client.chat.completions.create(
         model="gpt-5-mini",
         response_format={"type": "json_object"},
@@ -161,7 +180,7 @@ def get_clients_for_month(openai_client, drive_service, month, year):
             {"role": "user", "content": prompt},
         ],
     ).choices[0].message.content
-    
+
     try:
         data = json.loads(response)
         return data.get("clients", [])
@@ -173,14 +192,14 @@ def search_and_download_binders(openai_client, gmail_service, company_name):
     query = f'"{company_name}" label:binders has:attachment newer_than:2m'
     messages_response = gmail_service.users().messages().list(userId='me', q=query, maxResults=20).execute()
     messages = messages_response.get('messages', [])
-    
+
     documents_info = []
     downloaded_files = {}
 
     for message in messages:
         msg_id = message['id']
         msg = gmail_service.users().messages().get(userId='me', id=msg_id, format='full').execute()
-        
+
         parts = msg.get('payload', {}).get('parts', [])
         # If payload itself is multipart, check parts. Sometimes it's nested.
         def find_attachments(parts_list):
@@ -192,9 +211,9 @@ def search_and_download_binders(openai_client, gmail_service, company_name):
                         attachment = gmail_service.users().messages().attachments().get(
                             userId='me', messageId=msg_id, id=attachment_id
                         ).execute()
-                        
+
                         file_data = base64.urlsafe_b64decode(attachment['data'])
-                        
+
                         try:
                             pdf_reader = PyPDF2.PdfReader(BytesIO(file_data))
                             if pdf_reader.is_encrypted:
@@ -208,13 +227,13 @@ def search_and_download_binders(openai_client, gmail_service, company_name):
                             print(f"Warning: Could not parse PDF {filename}: {e}")
                             n_pages = 0
                             first_page_text = ""
-                        
+
                         documents_info.append({
                             "filename": filename,
                             "n_pages": n_pages,
                             "first_page_text": first_page_text[:1500]
                         })
-                        
+
                         downloaded_files[filename] = file_data
                 elif 'parts' in part:
                     find_attachments(part['parts'])
@@ -277,13 +296,13 @@ def get_driver_names(openai_client, drive_service, company_name):
     query = f"'{DRIVERS_FOLDER_ID}' in parents and name contains '{escaped_company}' and trashed = false"
     response = drive_service.files().list(q=query, fields="files(id, name, mimeType)").execute()
     files = response.get('files', [])
-    
+
     if not files:
         return []
-    
+
     file_id = files[0]['id']
     mime_type = files[0]['mimeType']
-    
+
     try:
         if 'google-apps.document' in mime_type:
             request = drive_service.files().export_media(fileId=file_id, mimeType='text/plain')
@@ -298,9 +317,9 @@ def get_driver_names(openai_client, drive_service, company_name):
     prompt = f"""
     You are given a text containing driver, and possibly some other
     information for an insurance policy.
-    Extract the names of the drivers. Output only the driver names, with first letters capitalized, 
+    Extract the names of the drivers. Output only the driver names, with first letters capitalized,
     one per item in a JSON list under the key `drivers`.
-    
+
     File content:
     {file_content}
     """
@@ -321,18 +340,495 @@ def get_driver_names(openai_client, drive_service, company_name):
         print("Failed to parse drivers.", e)
         return []
 
+
+# ── Portal-only carrier detection (GAIG / Paramount / Trinity) ─────────────
+#
+# These 3 insurer groups never email declaration documents -- they each sit
+# behind their own agent portal with no API, so the only way to get a dec
+# page is to log in and download it (see PortalSessions below). Which of a
+# client's coverage lines (if any) belongs to one of them is determined by
+# the policy number format, not the carrier's legal name on the COI (that
+# name varies a lot -- "Great American Insurance Group/Company/Co.", etc --
+# while the TPA-assigned policy number format is consistent). Patterns
+# confirmed against real COIs pulled from the certs Drive folder:
+#   GAIG:      "IMP F123456 00"           (MTC line, insurer = Great American)
+#   Trinity:   ends in "-LION"            (PD or GL line, never AL)
+#   Paramount: starts with "AGPGA3-"      (AL line, insurer = Agricultural
+#                                          Workers Mutual Auto Ins) -- only
+#                                          confirmed on 2 real examples so
+#                                          far; a policy that doesn't match
+#                                          any of the 3 just falls through to
+#                                          the normal email search above, so
+#                                          a gap here is a missed optimization,
+#                                          not a regression.
+def classify_portal_group(policy_number: str) -> str | None:
+    pn = (policy_number or "").upper()
+    if re.search(r"IMP\s*F\d", pn):
+        return "gaig"
+    if "LION" in pn:
+        return "trinity"
+    if pn.startswith("AGPGA3"):
+        return "paramount"
+    return None
+
+
+def _clean_field(fields: dict, name: str) -> str:
+    v = fields.get(name)
+    if v is None:
+        return ""
+    raw = v.value if hasattr(v, "value") else v.get("/V")
+    if raw is None:
+        return ""
+    if hasattr(raw, "get_object"):
+        raw = raw.get_object()
+    if isinstance(raw, bytes):
+        raw = raw.decode("utf-8", errors="ignore")
+    return str(raw).strip()
+
+
+def get_coi_policy_lines(drive_service, company_name: str):
+    """Download *company_name*'s COI from the certs Drive folder (same folder
+    the AMS backend syncs from) and return (insured_name, [{"coverage_type",
+    "policy_number"}, ...]) for its AL/MTC/GL/PD lines. (None, []) if no COI
+    is on file. insured_name is the exact "NamedInsured_FullName_A" value --
+    what we search each portal with, since it's what the carrier has on file
+    (more reliable than the Renewals-doc-extracted spelling)."""
+    escaped = company_name.replace("'", "\\'")
+    query = f"'{DRIVE_CERTS_FOLDER_ID}' in parents and name contains '{escaped}' and trashed = false"
+    try:
+        response = drive_service.files().list(q=query, pageSize=5, fields="files(id, name)").execute()
+    except Exception:
+        logging.exception(f"COI lookup failed for {company_name!r}")
+        return None, []
+    files = response.get("files", [])
+    if not files:
+        return None, []
+
+    file_id = files[0]["id"]
+    request = drive_service.files().get_media(fileId=file_id)
+    fh = BytesIO()
+    downloader = MediaIoBaseDownload(fh, request)
+    done = False
+    while not done:
+        _, done = downloader.next_chunk()
+    fh.seek(0)
+
+    reader = PdfReader(fh)
+    fields = reader.get_fields() or {}
+
+    insured_name = _clean_field(fields, "NamedInsured_FullName_A")
+
+    lines = []
+    al_policy = _clean_field(fields, "Policy_AutomobileLiability_PolicyNumberIdentifier_A")
+    if al_policy:
+        lines.append({"coverage_type": "AL", "policy_number": al_policy})
+
+    mtc_desc = _clean_field(fields, "OtherPolicy_OtherPolicyDescription_A")
+    mtc_policy = _clean_field(fields, "OtherPolicy_PolicyNumberIdentifier_A")
+    if mtc_policy and "cargo" in mtc_desc.lower():
+        lines.append({"coverage_type": "MTC", "policy_number": mtc_policy})
+
+    gl_policy = _clean_field(fields, "Policy_GeneralLiability_PolicyNumberIdentifier_A")
+    if gl_policy:
+        lines.append({"coverage_type": "GL", "policy_number": gl_policy})
+
+    remarks = _clean_field(fields, "CertificateOfLiabilityInsurance_ACORDForm_RemarkText_A")
+    m = PD_REMARKS_RE.search(remarks)
+    if m:
+        lines.append({"coverage_type": "PD", "policy_number": m.group(2).strip()})
+
+    return insured_name or company_name, lines
+
+
+class PortalSessions:
+    """Lazily logs into GAIG / Paramount / Trinity's agent portals, at most
+    once each per script run (a full monthly batch can then look up many
+    companies without repeating GAIG's ~90s email-OTP wait for every one).
+    A portal that fails to log in is not retried for the rest of the run --
+    every client that would have needed it just falls back to whatever the
+    normal email search already found (possibly nothing), same as if the
+    portal integration didn't exist."""
+
+    GAIG_DOC_NAME = "Insured - Renewal Policy Issue"
+    PARAMOUNT_DOC_NAME = "AGW Domestic Policy Document"
+    TRINITY_DOC_NAME = "Evidence of Insurance"
+
+    def __init__(self, gmail_service):
+        self.gmail_service = gmail_service
+        self._pw = None
+        self._browser = None
+        self._pages = {}
+        self._failed = set()
+
+    def __enter__(self):
+        self._pw = sync_playwright().start()
+        # Uses the system-installed Chrome (channel="chrome") rather than
+        # Playwright's own bundled Chromium download -- avoids needing a
+        # ~150MB browser download on every machine this ever runs on.
+        self._browser = self._pw.chromium.launch(channel="chrome", headless=True)
+        return self
+
+    def __exit__(self, exc_type, exc, tb):
+        if self._browser:
+            self._browser.close()
+        if self._pw:
+            self._pw.stop()
+
+    def download(self, group: str, insured_name: str) -> list[tuple[str, bytes]]:
+        page = self._get_page(group)
+        if not page:
+            return []
+        try:
+            if group == "gaig":
+                return self._download_gaig(page, insured_name)
+            if group == "paramount":
+                return self._download_paramount(page, insured_name)
+            if group == "trinity":
+                return self._download_trinity(page, insured_name)
+        except Exception:
+            logging.exception(f"{group} portal download failed for {insured_name!r}")
+            print(f"    -> {group.upper()} portal download failed for {insured_name}.")
+        return []
+
+    def _get_page(self, group):
+        if group in self._pages:
+            return self._pages[group]
+        if group in self._failed:
+            return None
+        try:
+            if group == "gaig":
+                page = self._login_gaig()
+            elif group == "paramount":
+                page = self._login_paramount()
+            elif group == "trinity":
+                page = self._login_trinity()
+            else:
+                return None
+        except Exception:
+            logging.exception(f"{group} portal login failed")
+            print(f"    -> Could not log into the {group.upper()} portal this run: skipping it for the rest of the batch.")
+            self._failed.add(group)
+            return None
+        self._pages[group] = page
+        return page
+
+    # --- GAIG ---------------------------------------------------------
+
+    def _find_gaig_verification_code(self, after_ts: float, timeout: int = 90) -> str | None:
+        deadline = time.time() + timeout
+        seen = set()
+        while time.time() < deadline:
+            resp = self.gmail_service.users().messages().list(
+                userId="me", q='from:noreply@gaig.com subject:"One-time verification code" newer_than:1h', maxResults=5
+            ).execute()
+            for m in resp.get("messages", []):
+                if m["id"] in seen:
+                    continue
+                msg = self.gmail_service.users().messages().get(userId="me", id=m["id"], format="full").execute()
+                internal_ts = int(msg.get("internalDate", 0)) / 1000
+                if internal_ts < after_ts - 15:
+                    seen.add(m["id"])
+                    continue
+                body = extract_text(msg.get("payload", {})) or ""
+                match = re.search(r"Enter a code instead:\s*(\d{6})", body)
+                if match:
+                    return match.group(1)
+                seen.add(m["id"])
+            time.sleep(3)
+        return None
+
+    def _login_gaig(self):
+        with open(GAIG_CREDS_PATH) as f:
+            creds = json.load(f)
+        print("    [GAIG] Logging in...")
+        page = self._browser.new_page(accept_downloads=True)
+        page.goto("https://login-registration.gaig.com/agent")
+        page.get_by_placeholder("Enter in your username").fill(creds["username"])
+        page.get_by_placeholder("Enter in your password").fill(creds["password"])
+        page.get_by_role("button", name="Log In").click()
+
+        page.wait_for_selector("text=Send me an email", timeout=20000)
+        sent_at = time.time()
+        page.get_by_role("button", name="Send me an email").click()
+        page.get_by_text("Enter a verification code instead").click()
+        page.wait_for_selector('input[name="credentials.passcode"]', timeout=10000)
+
+        print("    [GAIG] Waiting for the email verification code (up to 90s)...")
+        code = self._find_gaig_verification_code(sent_at)
+        if not code:
+            raise RuntimeError("GAIG: verification code email never arrived")
+
+        page.fill('input[name="credentials.passcode"]', code)
+        page.locator('input[type="submit"]').click()
+        page.wait_for_url(re.compile(r"agentportal\.gaig\.com"), timeout=30000)
+        print("    [GAIG] Logged in.")
+        return page
+
+    def _download_gaig(self, page, insured_name: str) -> list[tuple[str, bytes]]:
+        page.goto("https://agentportal.gaig.com/policies")
+        page.get_by_placeholder("Search by Policy Number or Insured Name").fill(insured_name)
+        page.get_by_test_id("policies-filter-box-search-button").click()
+        page.wait_for_timeout(2000)
+
+        row = page.locator("tr", has_text=insured_name).first
+        if row.count() == 0:
+            print(f"    [GAIG] No policy found for {insured_name!r}.")
+            return []
+        row.get_by_role("link").first.click()
+        page.wait_for_load_state("networkidle")
+
+        page.get_by_text("Policy Documents", exact=True).click()
+        page.wait_for_timeout(2000)
+
+        doc_row = page.locator("tr", has_text=self.GAIG_DOC_NAME).first
+        if doc_row.count() == 0:
+            print(f"    [GAIG] No '{self.GAIG_DOC_NAME}' document for {insured_name!r}.")
+            return []
+
+        os.makedirs(DOWNLOADS_DIR, exist_ok=True)
+        with page.expect_download() as download_info:
+            doc_row.get_by_role("button", name=re.compile("Download", re.I)).click()
+        download = download_info.value
+        tmp_path = os.path.join(DOWNLOADS_DIR, "_tmp_gaig.pdf")
+        download.save_as(tmp_path)
+        with open(tmp_path, "rb") as f:
+            data = f.read()
+        os.remove(tmp_path)
+
+        print(f"    [GAIG] Downloaded declaration for {insured_name!r}.")
+        return [(f"{insured_name} - GAIG Declaration.pdf", data)]
+
+    # --- Paramount ------------------------------------------------------
+
+    def _login_paramount(self):
+        with open(PARAMOUNT_CREDS_PATH) as f:
+            creds = json.load(f)
+        print("    [Paramount] Logging in...")
+        page = self._browser.new_page(accept_downloads=True)
+        page.add_init_script(
+            "window.__openedUrls = []; "
+            "const o = window.open; "
+            "window.open = function(url, ...args) { window.__openedUrls.push(url); return o.apply(window, [url, ...args]); };"
+        )
+        page.goto("https://paramount.onlinemga.com/amp/login?iss=https%3A%2F%2Fauth.onlinemga.com%2F")
+        page.get_by_role("button", name="CONTINUE TO LOG IN").wait_for(timeout=20000)
+        page.get_by_role("button", name="CONTINUE TO LOG IN").click()
+        page.wait_for_selector("#username", timeout=20000)
+        page.fill("#username", creds["username"])
+        page.fill("#password", creds["password"])
+        page.get_by_role("button", name="Continue").click()
+        page.wait_for_url("**/coverages", timeout=20000)
+        page.wait_for_timeout(1500)
+
+        page.get_by_role("link", name="OMGA").click()
+        page.wait_for_url("**/amp/list", timeout=20000)
+        page.wait_for_timeout(1500)
+        print("    [Paramount] Logged in.")
+        return page
+
+    def _download_paramount(self, page, insured_name: str) -> list[tuple[str, bytes]]:
+        page.goto("https://paramount.onlinemga.com/amp/list")
+        page.wait_for_timeout(1000)
+        page.get_by_text("Advanced", exact=True).click()
+        page.wait_for_timeout(1000)
+        page.fill('input[name="company_name"]', insured_name)
+        page.get_by_role("button", name="Search").click()
+        page.wait_for_load_state("networkidle")
+        page.wait_for_timeout(2000)
+
+        if page.locator("tr.itemRow").count() == 0:
+            print(f"    [Paramount] No policy found for {insured_name!r}.")
+            return []
+        app_id = page.locator("tr.itemRow").first.get_attribute("data-id")
+        if not app_id:
+            return []
+
+        page.goto(f"https://paramount.onlinemga.com/amp/detail/view/{app_id}#doctab-1")
+        page.wait_for_selector("tr.policyDocumentLink", timeout=20000)
+        page.wait_for_timeout(1500)
+
+        row = page.locator("tr.policyDocumentLink", has_text=self.PARAMOUNT_DOC_NAME)
+        if row.count() == 0:
+            print(f"    [Paramount] No '{self.PARAMOUNT_DOC_NAME}' document for {insured_name!r}.")
+            return []
+
+        page.evaluate("window.__openedUrls = []")
+        row.first.locator("span.file").evaluate("e => e.click()")
+        page.wait_for_timeout(2000)
+
+        opened = page.evaluate("window.__openedUrls")
+        if not opened:
+            print(f"    [Paramount] Document click did not open a document URL for {insured_name!r}.")
+            return []
+
+        doc_url = "https://paramount.onlinemga.com" + opened[-1]
+        resp = page.context.request.get(doc_url)
+        if resp.status != 200:
+            print(f"    [Paramount] Download failed (status {resp.status}) for {insured_name!r}.")
+            return []
+
+        print(f"    [Paramount] Downloaded declaration for {insured_name!r}.")
+        return [(f"{insured_name} - Paramount Declaration.pdf", resp.body())]
+
+    # --- Trinity ----------------------------------------------------------
+
+    def _login_trinity(self):
+        with open(TRINITY_CREDS_PATH) as f:
+            creds = json.load(f)
+        print("    [Trinity] Logging in...")
+        page = self._browser.new_page(accept_downloads=True)
+        page.goto("https://tru.tmsystems.ai/sign-in")
+        page.wait_for_selector("#email", timeout=20000)
+        page.fill("#email", creds["email"])
+        page.keyboard.press("Enter")
+        page.wait_for_selector("#password", timeout=20000)
+        page.fill("#password", creds["password"])
+        page.keyboard.press("Enter")
+        page.wait_for_url("https://tru.tmsystems.ai/", timeout=20000)
+        page.wait_for_timeout(1500)
+        print("    [Trinity] Logged in.")
+        return page
+
+    def _download_trinity(self, page, insured_name: str) -> list[tuple[str, bytes]]:
+        page.goto("https://tru.tmsystems.ai/bound-accounts")
+        page.wait_for_timeout(1500)
+        page.fill('input[placeholder="Search"]', insured_name)
+        page.wait_for_timeout(2000)
+
+        first_row = page.locator("tr[data-row-index]").first
+        if first_row.count() == 0:
+            print(f"    [Trinity] No submission found for {insured_name!r}.")
+            return []
+        first_row.locator("button").first.click()
+        page.wait_for_url("**/submissions/bound/**", timeout=20000)
+        page.wait_for_timeout(2000)
+
+        page.get_by_text("Policy Docs", exact=True).first.click()
+        page.wait_for_timeout(2000)
+
+        section_headers = page.locator(".lob-specific-accordion__title")
+        for i in range(section_headers.count()):
+            section_headers.nth(i).click()
+            page.wait_for_timeout(800)
+
+        rows = page.locator("tr", has_text=self.TRINITY_DOC_NAME)
+        n_rows = rows.count()
+        if n_rows == 0:
+            print(f"    [Trinity] No '{self.TRINITY_DOC_NAME}' document for {insured_name!r}.")
+            return []
+
+        os.makedirs(DOWNLOADS_DIR, exist_ok=True)
+        results = []
+        for i in range(n_rows):
+            row = rows.nth(i)
+            try:
+                with page.expect_download(timeout=15000) as dl_info:
+                    row.get_by_text("Download", exact=True).click()
+                download = dl_info.value
+                tmp_path = os.path.join(DOWNLOADS_DIR, f"_tmp_trinity_{i}.pdf")
+                download.save_as(tmp_path)
+                with open(tmp_path, "rb") as f:
+                    data = f.read()
+                os.remove(tmp_path)
+                suffix = f" ({i + 1})" if n_rows > 1 else ""
+                results.append((f"{insured_name} - Trinity Declaration{suffix}.pdf", data))
+            except Exception:
+                logging.exception(f"Trinity row download failed for {insured_name!r}")
+
+        print(f"    [Trinity] Downloaded {len(results)} declaration(s) for {insured_name!r}.")
+        return results
+
+
+def _coverage_types_of(coverage_type) -> set:
+    """A binder's coverage_type is usually a single string ("AL"), but the
+    LLM classifier in search_and_download_binders correctly returns a list
+    when one combined PDF covers multiple lines (e.g. a small carrier's
+    single packet for AL+MTC+PD) -- normalize either shape to a set."""
+    if isinstance(coverage_type, (list, tuple, set)):
+        return set(coverage_type)
+    return {coverage_type}
+
+
+def fetch_portal_only_documents(portals: PortalSessions, drive_service, company_name: str, already_found: set) -> dict:
+    """For *company_name*, look at its COI's coverage lines and try a portal
+    download for any line that (a) looks like it belongs to GAIG/Paramount/
+    Trinity by policy number, and (b) wasn't already found by the normal
+    email search (*already_found* is the set of coverage_types already in
+    hand). Returns a dict in the same {filename: {coverage_type, data}}
+    shape as search_and_download_binders, to be merged into it."""
+    insured_name, policy_lines = get_coi_policy_lines(drive_service, company_name)
+    if not policy_lines:
+        return {}
+
+    found = {}
+    for line in policy_lines:
+        if line["coverage_type"] in already_found:
+            continue
+        group = classify_portal_group(line["policy_number"])
+        if not group:
+            continue
+        print(f"  -> {line['coverage_type']} policy {line['policy_number']!r} looks like {group.upper()} -- trying the portal...")
+        for filename, data in portals.download(group, insured_name):
+            found[filename] = {"coverage_type": line["coverage_type"], "data": data}
+    return found
+
+
+# Order coverages so they read naturally in a sentence, and use the wording
+# the agency/clients actually use -- "APD", not "PD", for Physical Damage
+# (matches the Renewals doc's own "AL/APD/MTC" column and the carriers'
+# policy-number naming, e.g. "-APD-").
+_COVERAGE_ORDER = ["AL", "MTC", "PD", "GL"]
+_COVERAGE_LABELS = {"AL": "AL", "MTC": "MTC", "PD": "APD", "GL": "GL"}
+
+
+def _join_list(items: list[str]) -> str:
+    if not items:
+        return ""
+    if len(items) == 1:
+        return items[0]
+    return ' '.join(items[:-1]) + ' and ' + items[-1]
+
+
+def _coverage_phrase(coverage_types: set) -> str:
+    # GL doesn't count toward the "all 3 core coverages found" check, and
+    # isn't named either way -- only AL/MTC/PD are meaningful for this
+    # sentence. When all 3 are present, naming them is redundant (every
+    # client normally gets all 3), so it falls back to the plain original
+    # wording; naming them is only useful when the set is partial.
+    relevant = {c for c in coverage_types if c != 'GL'}
+    if {'AL', 'MTC', 'PD'} <= relevant:
+        return "policies"
+
+    labels = [_COVERAGE_LABELS.get(c, c) for c in _COVERAGE_ORDER if c in relevant]
+    labels += sorted(_COVERAGE_LABELS.get(c, c) for c in relevant if c not in _COVERAGE_ORDER)
+    if not labels:
+        return ""
+    word = 'policy' if len(labels) == 1 else 'policies'
+    return f"{_join_list(labels)} {word}"
+
+
 def create_draft_email(gmail_service, to_email, company_name, attachments, drivers):
     message = MIMEMultipart()
     if to_email:
         message['to'] = to_email
     message['from'] = SENDER_EMAIL
     message['subject'] = f"Declaration Documents: {company_name.upper()}"
-    
+
+    coverage_types = set()
+    for info in attachments.values():
+        coverage_types |= _coverage_types_of(info['coverage_type'])
+    coverage_phrase = _coverage_phrase(coverage_types)
+
+    if coverage_phrase:
+        coverage_line = f"Please see the declaration documents of your {coverage_phrase} attached for your reference."
+    else:
+        coverage_line = "We were unable to locate declaration documents for your policies this cycle -- please let us know if you have them on hand."
+
     drivers_list_str = "\n".join([f" * {driver}" for driver in drivers])
-    
+
     body = f"""Hello,
 
-Please see the declaration documents of your policies attached for your reference.
+{coverage_line}
 Please see the drivers included in the policies below:
 {drivers_list_str}
 
@@ -343,31 +839,31 @@ Lion Insurance Services."""
 
     msg = MIMEText(body)
     message.attach(msg)
-    
+
     for filename, file_info in attachments.items():
         part = MIMEBase('application', 'octet-stream')
         part.set_payload(file_info['data'])
         encoders.encode_base64(part)
         part.add_header('Content-Disposition', f'attachment; filename="{filename}"')
         message.attach(part)
-        
+
     raw_message = base64.urlsafe_b64encode(message.as_bytes()).decode('utf-8')
-    
+
     draft_body = {
         'message': {
             'raw': raw_message,
         }
     }
-    
+
     try:
         draft = gmail_service.users().drafts().create(userId='me', body=draft_body).execute()
         print(f"Draft created for {company_name} to {to_email}. Draft ID: {draft['id']}")
-        
+
         attached_docs = ", ".join([f"{k} ({v['coverage_type']})" for k, v in attachments.items()])
         if not attached_docs:
             attached_docs = "None"
         logging.info(f"Successfully created draft for '{company_name}' to {to_email}. Attached docs: {attached_docs}")
-        
+
         # Add label
         labels_results = gmail_service.users().labels().list(userId='me').execute()
         labels = labels_results.get('labels', [])
@@ -377,7 +873,7 @@ Lion Insurance Services."""
             if label['name'].lower().replace(" ", "-") == "declaration-documents":
                 target_label_id = label['id']
                 break
-                
+
         if not target_label_id:
             label_body = {
                 "name": "Declaration Documents",
@@ -386,12 +882,12 @@ Lion Insurance Services."""
             }
             created_label = gmail_service.users().labels().create(userId='me', body=label_body).execute()
             target_label_id = created_label['id']
-            
+
         if target_label_id:
             msg_id = draft['message']['id']
             gmail_service.users().messages().modify(
-                userId='me', 
-                id=msg_id, 
+                userId='me',
+                id=msg_id,
                 body={'addLabelIds': [target_label_id]}
             ).execute()
             print(f"Added label 'declaration-documents' to draft.")
@@ -402,52 +898,66 @@ Lion Insurance Services."""
 def main():
     target_month = input("Enter the month of the previous month (e.g., January): ").strip()
     target_year = input("Enter the year of the previous month (e.g., 2024): ").strip()
-    
+
     openai_key = load_openai_key()
     if not openai_key:
         print("Error: OpenAI key is missing. Please create keys/openai_key.txt")
         logging.error("OpenAI key is missing. Script aborted.")
         return
-        
+
     openai_client = OpenAI(api_key=openai_key)
-    
+
     print("Initializing Google Services...")
     drive_service, gmail_service = get_google_services()
     if not drive_service or not gmail_service:
         return
-        
+
     print(f"\nFetching clients for {target_month} {target_year}...")
     clients = get_clients_for_month(openai_client, drive_service, target_month, target_year)
     print(f"Found {len(clients)} clients: {clients}")
-    
-    for client in clients:
-        print(f"\n--- Processing client: {client} ---")
-        
-        email = find_signer_email_for_company(gmail_service, client)
-        if not email:
-            print(f"-> Could not find main email for {client}. Draft will be created without 'To' address.")
-            logging.warning(f"Could not find main email for '{client}'. Draft will be created without 'To' address.")
-            email = ""
-        else:
-            print(f"-> Found main email: {email}")
-        
-        print("-> Searching for declaration documents in Gmail...")
-        attachments = search_and_download_binders(openai_client, gmail_service, client)
-        if attachments:
-            found_docs = [f"{k} ({v['coverage_type']})" for k, v in attachments.items()]
-            print(f"-> Found valid policy documents: {', '.join(found_docs)}")
-        else:
-            print("-> Could not find suitable declaration documents. Creating draft without attachments.")
-            logging.warning(f"Could not find suitable declaration documents for '{client}'. Draft will be created without attachments.")
-            
-        print("-> Searching for drivers in Google Drive...")
-        drivers = get_driver_names(openai_client, drive_service, client)
-        print(f"-> Found {len(drivers)} drivers: {drivers}")
-        
-        print("-> Creating draft email...")
-        create_draft_email(gmail_service, email, client, attachments, drivers)
-        
-    print("\n✅ Finished processing all clients.")
+
+    with PortalSessions(gmail_service) as portals:
+        for client in clients:
+            print(f"\n--- Processing client: {client} ---")
+
+            email = find_signer_email_for_company(gmail_service, client)
+            if not email:
+                print(f"-> Could not find main email for {client}. Draft will be created without 'To' address.")
+                logging.warning(f"Could not find main email for '{client}'. Draft will be created without 'To' address.")
+                email = ""
+            else:
+                print(f"-> Found main email: {email}")
+
+            print("-> Searching for declaration documents in Gmail...")
+            attachments = search_and_download_binders(openai_client, gmail_service, client)
+            if attachments:
+                found_docs = [f"{k} ({v['coverage_type']})" for k, v in attachments.items()]
+                print(f"-> Found valid policy documents by email: {', '.join(found_docs)}")
+            else:
+                print("-> Could not find suitable declaration documents by email.")
+
+            print("-> Checking COI for GAIG/Paramount/Trinity coverage lines...")
+            already_found = set()
+            for v in attachments.values():
+                already_found |= _coverage_types_of(v['coverage_type'])
+            portal_docs = fetch_portal_only_documents(portals, drive_service, client, already_found)
+            if portal_docs:
+                found_docs = [f"{k} ({v['coverage_type']})" for k, v in portal_docs.items()]
+                print(f"-> Found additional documents via portals: {', '.join(found_docs)}")
+                attachments.update(portal_docs)
+
+            if not attachments:
+                print("-> No declaration documents found from any source. Creating draft without attachments.")
+                logging.warning(f"Could not find any declaration documents for '{client}'. Draft will be created without attachments.")
+
+            print("-> Searching for drivers in Google Drive...")
+            drivers = get_driver_names(openai_client, drive_service, client)
+            print(f"-> Found {len(drivers)} drivers: {drivers}")
+
+            print("-> Creating draft email...")
+            create_draft_email(gmail_service, email, client, attachments, drivers)
+
+    print("\nFinished processing all clients.")
 
 if __name__ == "__main__":
     main()
