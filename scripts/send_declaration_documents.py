@@ -1,4 +1,5 @@
 import os
+import sys
 import json
 import base64
 import re
@@ -281,6 +282,13 @@ def search_and_download_binders(openai_client, gmail_service, company_name):
         final_files = {}
         for filename, coverage_type in selected_docs_mapping.items():
             if filename in downloaded_files:
+                # GAIG emails its packets named by policy number, e.g.
+                # "IMPF57941400 New Business Policy Issue 09_18_2026.pdf", and
+                # GAIG only writes the agency's cargo line -- so that's MTC no
+                # matter what the classifier guessed (it has labeled the same
+                # file AL on one run and MTC on the next).
+                if GAIG_FILENAME_RE.search(filename):
+                    coverage_type = "MTC"
                 final_files[filename] = {
                     "coverage_type": coverage_type,
                     "data": downloaded_files[filename]
@@ -361,6 +369,9 @@ def get_driver_names(openai_client, drive_service, company_name):
 #                                          the normal email search above, so
 #                                          a gap here is a missed optimization,
 #                                          not a regression.
+GAIG_FILENAME_RE = re.compile(r"\bIMP\s*F\s*\d{6}", re.I)
+
+
 def classify_portal_group(policy_number: str) -> str | None:
     pn = (policy_number or "").upper()
     if re.search(r"IMP\s*F\d", pn):
@@ -370,6 +381,24 @@ def classify_portal_group(policy_number: str) -> str | None:
     if pn.startswith("AGPGA3"):
         return "paramount"
     return None
+
+
+# ACORD 25 certs come in two builds. The classic AcroForm one names fields
+# plainly ("NamedInsured_FullName_A"); the newer XFA-based one (certs issued
+# from ~Sept 2026 on) wraps the same names in a form path:
+# "F[0].P1[0].NamedInsured_FullName_A[0]". Re-key by the plain name so the
+# lookups below work on both (mirrors lion.integrations.pdf in the AMS).
+_ACORD_FIELD_PATH_RE = re.compile(r"^(?:.*\.)?([^.\[\]]+)(?:\[\d+\])?$")
+
+
+def _normalize_acord_fields(fields: dict) -> dict:
+    out = {}
+    for k, v in (fields or {}).items():
+        m = _ACORD_FIELD_PATH_RE.match(k)
+        short = m.group(1) if m else k
+        if short not in out or k == short:
+            out[short] = v
+    return out
 
 
 def _clean_field(fields: dict, name: str) -> str:
@@ -414,7 +443,7 @@ def get_coi_policy_lines(drive_service, company_name: str):
     fh.seek(0)
 
     reader = PdfReader(fh)
-    fields = reader.get_fields() or {}
+    fields = _normalize_acord_fields(reader.get_fields())
 
     insured_name = _clean_field(fields, "NamedInsured_FullName_A")
 
@@ -449,7 +478,11 @@ class PortalSessions:
     normal email search already found (possibly nothing), same as if the
     portal integration didn't exist."""
 
-    GAIG_DOC_NAME = "Insured - Renewal Policy Issue"
+    # GAIG names the dec packet by transaction: "Insured - Renewal Policy
+    # Issue" on a renewal (policy # suffix 01, 02, ...) but "Insured - New
+    # Business Policy Issue" on a first term (suffix 00). The "Agent/Company -
+    # ..." twin of each is the agent copy, not what the client gets.
+    GAIG_DOC_NAME = re.compile(r"^\s*Insured - .*Policy Issue", re.I)
     PARAMOUNT_DOC_NAME = "AGW Domestic Policy Document"
     TRINITY_DOC_NAME = "Evidence of Insurance"
 
@@ -474,13 +507,13 @@ class PortalSessions:
         if self._pw:
             self._pw.stop()
 
-    def download(self, group: str, insured_name: str) -> list[tuple[str, bytes]]:
+    def download(self, group: str, insured_name: str, policy_number: str = "") -> list[tuple[str, bytes]]:
         page = self._get_page(group)
         if not page:
             return []
         try:
             if group == "gaig":
-                return self._download_gaig(page, insured_name)
+                return self._download_gaig(page, insured_name, policy_number)
             if group == "paramount":
                 return self._download_paramount(page, insured_name)
             if group == "trinity":
@@ -542,6 +575,11 @@ class PortalSessions:
             creds = json.load(f)
         print("    [GAIG] Logging in...")
         page = self._browser.new_page(accept_downloads=True)
+        # The portal embeds a Maze user-survey widget that pops up at random
+        # as an <iframe id="maze-contextual-widget-host"> covering the page;
+        # when it lands over a Download link Playwright refuses to click
+        # through it and the download times out. Block it at the network.
+        page.route(re.compile(r"^https?://[^/]*maze[^/]*/"), lambda route: route.abort())
         page.goto("https://login-registration.gaig.com/agent")
         page.get_by_placeholder("Enter in your username").fill(creds["username"])
         page.get_by_placeholder("Enter in your password").fill(creds["password"])
@@ -564,15 +602,32 @@ class PortalSessions:
         print("    [GAIG] Logged in.")
         return page
 
-    def _download_gaig(self, page, insured_name: str) -> list[tuple[str, bytes]]:
-        page.goto("https://agentportal.gaig.com/policies")
-        page.get_by_placeholder("Search by Policy Number or Insured Name").fill(insured_name)
-        page.get_by_test_id("policies-filter-box-search-button").click()
-        page.wait_for_timeout(2000)
+    @staticmethod
+    def _gaig_policy_key(policy_number: str) -> tuple[str, str] | None:
+        """"IMP F406082 01" / "IMP F580840-00" -> ("F406082", "01")."""
+        m = re.search(r"F\s*(\d{6})\D*(\d{2})", (policy_number or "").upper())
+        return (f"F{m.group(1)}", m.group(2)) if m else None
 
-        row = page.locator("tr", has_text=insured_name).first
-        if row.count() == 0:
-            print(f"    [GAIG] No policy found for {insured_name!r}.")
+    def _download_gaig(self, page, insured_name: str, policy_number: str = "") -> list[tuple[str, bytes]]:
+        # Search by the policy's F-number when we have one (the portal matches
+        # it, but not the full "IMPF40608201" form) -- it's unique, whereas the
+        # insured name on the COI can differ from the portal's spelling. Then
+        # pick the row for this exact term: a renewed client shows the EXPIRED
+        # "00" row next to the INFORCE "01" one.
+        key = self._gaig_policy_key(policy_number)
+        attempts = ([(key[0], re.compile(rf"{key[0]}\s*-?\s*{key[1]}"))] if key else []) + [(insured_name, insured_name)]
+        row = None
+        for term, row_text in attempts:
+            page.goto("https://agentportal.gaig.com/policies")
+            page.get_by_placeholder("Search by Policy Number or Insured Name").fill(term)
+            page.get_by_test_id("policies-filter-box-search-button").click()
+            page.wait_for_timeout(2000)
+            candidate = page.locator("tbody tr", has_text=row_text).first
+            if candidate.count() > 0:
+                row = candidate
+                break
+        if row is None:
+            print(f"    [GAIG] No policy found for {insured_name!r} ({policy_number or 'no policy #'}).")
             return []
         row.get_by_role("link").first.click()
         page.wait_for_load_state("networkidle")
@@ -582,8 +637,13 @@ class PortalSessions:
 
         doc_row = page.locator("tr", has_text=self.GAIG_DOC_NAME).first
         if doc_row.count() == 0:
-            print(f"    [GAIG] No '{self.GAIG_DOC_NAME}' document for {insured_name!r}.")
+            names = [t.strip() for t in page.locator("tbody tr td:first-child").all_inner_texts()]
+            print(f"    [GAIG] No 'Insured - ... Policy Issue' document for {insured_name!r}. Documents listed: {names}")
             return []
+
+        # Belt and braces for the survey widget (see _login_gaig): drop any
+        # instance that still made it into the DOM before clicking.
+        page.evaluate("document.querySelectorAll('#maze-contextual-widget-host').forEach(e => e.remove())")
 
         os.makedirs(DOWNLOADS_DIR, exist_ok=True)
         with page.expect_download() as download_info:
@@ -768,7 +828,7 @@ def fetch_portal_only_documents(portals: PortalSessions, drive_service, company_
         if not group:
             continue
         print(f"  -> {line['coverage_type']} policy {line['policy_number']!r} looks like {group.upper()} -- trying the portal...")
-        for filename, data in portals.download(group, insured_name):
+        for filename, data in portals.download(group, insured_name, line["policy_number"]):
             found[filename] = {"coverage_type": line["coverage_type"], "data": data}
     return found
 
@@ -895,9 +955,23 @@ Lion Insurance Services."""
         print(f"An error occurred while creating draft for {company_name}: {e}")
         logging.error(f"Error creating draft for '{company_name}': {e}")
 
+def _parse_only_arg(argv: list[str]) -> list[str] | None:
+    """`--only "CLIENT A,CLIENT B"` re-runs just those clients (exact names as
+    they appear in the Renewals doc) instead of a whole month -- for redoing
+    a few drafts after fixing something, without recreating everyone else's."""
+    for i, a in enumerate(argv):
+        if a == "--only" and i + 1 < len(argv):
+            return [c.strip() for c in argv[i + 1].split(",") if c.strip()]
+        if a.startswith("--only="):
+            return [c.strip() for c in a[len("--only="):].split(",") if c.strip()]
+    return None
+
+
 def main():
-    target_month = input("Enter the month of the previous month (e.g., January): ").strip()
-    target_year = input("Enter the year of the previous month (e.g., 2024): ").strip()
+    only_clients = _parse_only_arg(sys.argv[1:])
+    if only_clients is None:
+        target_month = input("Enter the month of the previous month (e.g., January): ").strip()
+        target_year = input("Enter the year of the previous month (e.g., 2024): ").strip()
 
     openai_key = load_openai_key()
     if not openai_key:
@@ -912,9 +986,13 @@ def main():
     if not drive_service or not gmail_service:
         return
 
-    print(f"\nFetching clients for {target_month} {target_year}...")
-    clients = get_clients_for_month(openai_client, drive_service, target_month, target_year)
-    print(f"Found {len(clients)} clients: {clients}")
+    if only_clients is not None:
+        clients = only_clients
+        print(f"\nRe-running only {len(clients)} client(s): {clients}")
+    else:
+        print(f"\nFetching clients for {target_month} {target_year}...")
+        clients = get_clients_for_month(openai_client, drive_service, target_month, target_year)
+        print(f"Found {len(clients)} clients: {clients}")
 
     with PortalSessions(gmail_service) as portals:
         for client in clients:
