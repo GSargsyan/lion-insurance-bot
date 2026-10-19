@@ -809,23 +809,42 @@ def _coverage_types_of(coverage_type) -> set:
     return {coverage_type}
 
 
-def fetch_portal_only_documents(portals: PortalSessions, drive_service, company_name: str, already_found: set) -> dict:
+# What an emailed dec packet from each portal carrier is called, so an email
+# hit can be trusted to cover that carrier's line. GAIG names packets by
+# policy number ("IMPF57941400 New Business Policy Issue ...pdf"); Trinity's
+# are the "Evidence of Insurance" exports from its TMS portal ("SUB-xxxxxxxx-
+# Evidence-of-Insurance-APD.pdf"); Paramount's carry the AGPGA3- policy #.
+_PORTAL_FILENAME_RES = {
+    "gaig": GAIG_FILENAME_RE,
+    "trinity": re.compile(r"evidence.of.insurance|-LION|SUB-[0-9A-F]{8}", re.I),
+    "paramount": re.compile(r"AGPGA3", re.I),
+}
+
+
+def fetch_portal_only_documents(portals: PortalSessions, drive_service, company_name: str, email_found: dict) -> dict:
     """For *company_name*, look at its COI's coverage lines and try a portal
     download for any line that (a) looks like it belongs to GAIG/Paramount/
-    Trinity by policy number, and (b) wasn't already found by the normal
-    email search (*already_found* is the set of coverage_types already in
-    hand). Returns a dict in the same {filename: {coverage_type, data}}
-    shape as search_and_download_binders, to be merged into it."""
+    Trinity by policy number, and (b) isn't already covered by an emailed
+    file *from that carrier*. *email_found* is search_and_download_binders'
+    result. A combined packet from some other carrier that the classifier
+    says covers "AL, MTC, PD" can't contain GAIG's MTC dec, so only a file
+    recognizably from the line's own carrier counts as covering it.
+    Returns a dict in the same {filename: {coverage_type, data}} shape, to be
+    merged into it."""
     insured_name, policy_lines = get_coi_policy_lines(drive_service, company_name)
     if not policy_lines:
         return {}
 
     found = {}
     for line in policy_lines:
-        if line["coverage_type"] in already_found:
-            continue
         group = classify_portal_group(line["policy_number"])
         if not group:
+            continue
+        own_carrier_files = [
+            fn for fn, v in email_found.items()
+            if line["coverage_type"] in _coverage_types_of(v["coverage_type"]) and _PORTAL_FILENAME_RES[group].search(fn)
+        ]
+        if own_carrier_files:
             continue
         print(f"  -> {line['coverage_type']} policy {line['policy_number']!r} looks like {group.upper()} -- trying the portal...")
         for filename, data in portals.download(group, insured_name, line["policy_number"]):
@@ -1015,10 +1034,7 @@ def main():
                 print("-> Could not find suitable declaration documents by email.")
 
             print("-> Checking COI for GAIG/Paramount/Trinity coverage lines...")
-            already_found = set()
-            for v in attachments.values():
-                already_found |= _coverage_types_of(v['coverage_type'])
-            portal_docs = fetch_portal_only_documents(portals, drive_service, client, already_found)
+            portal_docs = fetch_portal_only_documents(portals, drive_service, client, attachments)
             if portal_docs:
                 found_docs = [f"{k} ({v['coverage_type']})" for k, v in portal_docs.items()]
                 print(f"-> Found additional documents via portals: {', '.join(found_docs)}")
