@@ -2,6 +2,7 @@ import os
 import sys
 import json
 import base64
+import difflib
 import re
 import time
 import logging
@@ -21,7 +22,7 @@ from googleapiclient.http import MediaIoBaseDownload
 from openai import OpenAI
 import PyPDF2
 from pypdf import PdfReader
-from playwright.sync_api import sync_playwright
+from playwright.sync_api import sync_playwright, TimeoutError as PlaywrightTimeoutError
 
 # --- Configuration ---
 KEYS_DIR = os.path.join(os.path.dirname(__file__), "..", "keys")
@@ -511,16 +512,24 @@ class PortalSessions:
         page = self._get_page(group)
         if not page:
             return []
-        try:
-            if group == "gaig":
-                return self._download_gaig(page, insured_name, policy_number)
-            if group == "paramount":
-                return self._download_paramount(page, insured_name)
-            if group == "trinity":
-                return self._download_trinity(page, insured_name)
-        except Exception:
-            logging.exception(f"{group} portal download failed for {insured_name!r}")
-            print(f"    -> {group.upper()} portal download failed for {insured_name}.")
+        # One retry: portal pages sometimes load too slowly and time out (Oct
+        # 2026 batch lost EVERGREEN's and US 1's decs that way). A "not found"
+        # returns [] without raising, so it isn't retried.
+        for attempt in (1, 2):
+            try:
+                if group == "gaig":
+                    return self._download_gaig(page, insured_name, policy_number)
+                if group == "paramount":
+                    return self._download_paramount(page, insured_name)
+                if group == "trinity":
+                    return self._download_trinity(page, insured_name)
+                return []
+            except Exception:
+                logging.exception(f"{group} portal download failed for {insured_name!r} (attempt {attempt})")
+                if attempt == 1:
+                    print(f"    -> {group.upper()} portal download failed for {insured_name}, retrying once...")
+                else:
+                    print(f"    -> {group.upper()} portal download failed for {insured_name}.")
         return []
 
     def _get_page(self, group):
@@ -633,9 +642,16 @@ class PortalSessions:
         page.wait_for_load_state("networkidle")
 
         page.get_by_text("Policy Documents", exact=True).click()
-        page.wait_for_timeout(2000)
 
+        # The documents table loads asynchronously. A fixed 2s wait wasn't
+        # enough when the portal was slow (Oct 2026 batch: HAULIX's table was
+        # still empty at 2s although its packet was there), so wait for the
+        # row itself.
         doc_row = page.locator("tr", has_text=self.GAIG_DOC_NAME).first
+        try:
+            doc_row.wait_for(timeout=30000)
+        except PlaywrightTimeoutError:
+            pass
         if doc_row.count() == 0:
             names = [t.strip() for t in page.locator("tbody tr td:first-child").all_inner_texts()]
             print(f"    [GAIG] No 'Insured - ... Policy Issue' document for {insured_name!r}. Documents listed: {names}")
@@ -696,12 +712,25 @@ class PortalSessions:
         page.wait_for_load_state("networkidle")
         page.wait_for_timeout(2000)
 
-        if page.locator("tr.itemRow").count() == 0:
+        rows = page.locator("tr.itemRow")
+        if rows.count() == 0:
             print(f"    [Paramount] No policy found for {insured_name!r}.")
             return []
-        app_id = page.locator("tr.itemRow").first.get_attribute("data-id")
-        if not app_id:
+        # The search lists every application for the insured, quotes included,
+        # and the first row isn't necessarily the policy (Oct 2026: EVERGREEN's
+        # first row was an archived, expired quote with no documents). Use the
+        # newest Bound one; application ids increase over time.
+        bound_ids = []
+        for i in range(rows.count()):
+            row = rows.nth(i)
+            if re.search(r"\bBound\b", row.inner_text()):
+                row_id = row.get_attribute("data-id") or ""
+                if row_id.isdigit():
+                    bound_ids.append(int(row_id))
+        if not bound_ids:
+            print(f"    [Paramount] No bound policy found for {insured_name!r} (only quotes).")
             return []
+        app_id = max(bound_ids)
 
         page.goto(f"https://paramount.onlinemga.com/amp/detail/view/{app_id}#doctab-1")
         page.wait_for_selector("tr.policyDocumentLink", timeout=20000)
@@ -974,6 +1003,57 @@ Lion Insurance Services."""
         print(f"An error occurred while creating draft for {company_name}: {e}")
         logging.error(f"Error creating draft for '{company_name}': {e}")
 
+def _normalize_company(name: str) -> str:
+    return re.sub(r"\s+", " ", name.upper().replace("&", " & ")).strip()
+
+
+def resolve_client_names(drive_service, clients: list[str]) -> list[str]:
+    """Swap a misspelled Renewals-doc name for the client's cert filename, so
+    the Gmail/Drive/portal searches use the name the client is actually on
+    file under (Oct 2026: the doc's "Mission Transportation Soultions LLC" is
+    really "MISSION TRANSPORT SOLUTIONS LLC", and every exact-text search
+    missed). Names that already match a cert (ignoring case/spacing) are left
+    as-is. A correction needs a clear winner: similar names score high too
+    (PZ vs ZR TRANSPORTATION is 0.95), so the best match must score >= 0.85
+    and beat the runner-up by >= 0.1. Otherwise the name is kept and flagged."""
+    cert_names, page_token = [], None
+    try:
+        while True:
+            resp = drive_service.files().list(
+                q=f"'{DRIVE_CERTS_FOLDER_ID}' in parents and trashed = false",
+                pageSize=1000, fields="nextPageToken, files(name)", pageToken=page_token,
+            ).execute()
+            cert_names += [f["name"][:-4] for f in resp.get("files", []) if f["name"].lower().endswith(".pdf")]
+            page_token = resp.get("nextPageToken")
+            if not page_token:
+                break
+    except Exception:
+        logging.exception("Listing the certs folder for name matching failed")
+        return clients
+
+    by_norm = {_normalize_company(n): n for n in cert_names}
+    resolved = []
+    for client in clients:
+        norm = _normalize_company(client)
+        if norm in by_norm:
+            resolved.append(client)
+            continue
+        scored = sorted(
+            ((difflib.SequenceMatcher(None, norm, k).ratio(), by_norm[k]) for k in by_norm), reverse=True
+        )
+        best = scored[0] if scored else (0, None)
+        runner_up = scored[1][0] if len(scored) > 1 else 0
+        if best[0] >= 0.85 and best[0] - runner_up >= 0.1:
+            print(f"!! '{client}' (Renewals doc) has no cert under that name -- using cert name '{best[1]}'")
+            logging.warning(f"Renamed '{client}' -> '{best[1]}' (score {best[0]:.2f}, runner-up {runner_up:.2f})")
+            resolved.append(best[1])
+        else:
+            print(f"!! '{client}' (Renewals doc) has no cert under that name and no clear match -- searches may come up empty")
+            logging.warning(f"No cert match for '{client}' (best {best})")
+            resolved.append(client)
+    return resolved
+
+
 def _parse_only_arg(argv: list[str]) -> list[str] | None:
     """`--only "CLIENT A,CLIENT B"` re-runs just those clients (exact names as
     they appear in the Renewals doc) instead of a whole month -- for redoing
@@ -1012,6 +1092,8 @@ def main():
         print(f"\nFetching clients for {target_month} {target_year}...")
         clients = get_clients_for_month(openai_client, drive_service, target_month, target_year)
         print(f"Found {len(clients)} clients: {clients}")
+
+    clients = resolve_client_names(drive_service, clients)
 
     with PortalSessions(gmail_service) as portals:
         for client in clients:
